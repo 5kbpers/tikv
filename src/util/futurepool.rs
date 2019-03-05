@@ -29,6 +29,12 @@ use crate::util;
 use crate::util::collections::HashMap;
 use crate::util::time::Instant;
 
+#[cfg(not(test))]
+const THREADS_PER_CPUPOOL: usize = 4;
+
+#[cfg(test)]
+const THREADS_PER_CPUPOOL: usize = 1;
+
 lazy_static! {
     pub static ref FUTUREPOOL_PENDING_TASK_VEC: IntGaugeVec = register_int_gauge_vec!(
         "tikv_futurepool_pending_task_total",
@@ -130,7 +136,9 @@ impl<T: Context> ContextDelegators<T> {
 
 /// A future thread pool that supports `on_tick` for each thread.
 pub struct FuturePool<T: Context + 'static> {
-    pool: CpuPool,
+    pools: Arc<Vec<CpuPool>>,
+    pool_count: usize,
+    next_pool: Arc<AtomicUsize>,
     context_delegators: ContextDelegators<T>,
     running_task_count: Arc<AtomicUsize>,
     metrics_pending_task_count: IntGauge,
@@ -140,7 +148,7 @@ pub struct FuturePool<T: Context + 'static> {
 impl<T: Context + 'static> fmt::Debug for FuturePool<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         f.debug_struct("FuturePool")
-            .field("pool", &self.pool)
+            .field("pools", &self.pools)
             .field("context_delegators", &self.context_delegators)
             .finish()
     }
@@ -149,7 +157,9 @@ impl<T: Context + 'static> fmt::Debug for FuturePool<T> {
 impl<T: Context + 'static> Clone for FuturePool<T> {
     fn clone(&self) -> FuturePool<T> {
         FuturePool {
-            pool: self.pool.clone(),
+            pools: self.pools.clone(),
+            pool_count: self.pool_count,
+            next_pool: Arc::clone(&self.next_pool),
             context_delegators: self.context_delegators.clone(),
             running_task_count: Arc::clone(&self.running_task_count),
             metrics_pending_task_count: self.metrics_pending_task_count.clone(),
@@ -173,18 +183,25 @@ impl<T: Context + 'static> FuturePool<T> {
         F: Fn() -> T,
     {
         let (tx, rx) = mpsc::sync_channel(pool_size);
-        let pool = cpupool::Builder::new()
-            .pool_size(pool_size)
-            .stack_size(stack_size)
-            .name_prefix(name_prefix)
-            .after_start(move || {
-                // We only need to know each thread's id and we can build context later
-                // by invoking `context_factory` in a non-concurrent way.
-                let thread_id = thread::current().id();
-                tx.send(thread_id).unwrap();
+        let pool_count = (pool_size + THREADS_PER_CPUPOOL - 1) / THREADS_PER_CPUPOOL;
+        let thread_count = pool_count * THREADS_PER_CPUPOOL;
+        let pools = (0..pool_count)
+            .map(|_| {
+                let tx = tx.clone();
+                cpupool::Builder::new()
+                .pool_size(THREADS_PER_CPUPOOL)
+                .stack_size(stack_size)
+                .name_prefix(name_prefix)
+                .after_start(move || {
+                    // We only need to know each thread's id and we can build context later
+                    // by invoking `context_factory` in a non-concurrent way.
+                    let thread_id = thread::current().id();
+                    tx.send(thread_id).unwrap();
+                })
+                .create()
             })
-            .create();
-        let contexts = (0..pool_size)
+            .collect();
+        let contexts = (0..thread_count)
             .map(|_| {
                 let thread_id = rx.recv().unwrap();
                 let context_delegator = ContextDelegator::new(context_factory(), tick_interval);
@@ -192,7 +209,9 @@ impl<T: Context + 'static> FuturePool<T> {
             })
             .collect();
         FuturePool {
-            pool,
+            pools: Arc::new(pools),
+            pool_count,
+            next_pool: Arc::new(AtomicUsize::new(0)),
             context_delegators: ContextDelegators::new(contexts),
             running_task_count: Arc::new(AtomicUsize::new(0)),
             metrics_pending_task_count: FUTUREPOOL_PENDING_TASK_VEC
@@ -232,7 +251,9 @@ impl<T: Context + 'static> FuturePool<T> {
 
         self.running_task_count.fetch_add(1, Ordering::Release);
         self.metrics_pending_task_count.inc();
-        self.pool.spawn_fn(func)
+
+        let next_pool = self.next_pool.fetch_add(1, Ordering::Release) % self.pool_count;
+        self.pools.get(next_pool).unwrap().spawn_fn(func)
     }
 }
 
