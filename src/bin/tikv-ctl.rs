@@ -47,21 +47,24 @@ use futures::{future, stream, Future, Stream};
 use grpcio::{CallOption, ChannelBuilder, Environment};
 use protobuf::Message;
 use protobuf::RepeatedField;
+use rocksdb::{Writable, WriteBatch, WriteOptions};
 
 use kvproto::debugpb::{DB as DBType, *};
 use kvproto::debugpb_grpc::DebugClient;
 use kvproto::kvrpcpb::{MvccInfo, SplitRegionRequest};
 use kvproto::metapb::{Peer, Region};
 use kvproto::raft_cmdpb::RaftCmdRequest;
-use kvproto::raft_serverpb::{PeerState, SnapshotMeta};
+use kvproto::raft_serverpb::{PeerState, SnapshotMeta, StoreIdent};
 use kvproto::tikvpb_grpc::TikvClient;
 use raft::eraftpb::{ConfChange, Entry, EntryType};
 
+use core::borrow::BorrowMut;
 use tikv::config::TiKvConfig;
 use tikv::pd::{Config as PdConfig, PdClient, RpcClient};
+use tikv::raftstore::store::engine::{Iterable, Mutable, Peekable};
 use tikv::raftstore::store::{keys, Engines};
 use tikv::server::debug::{BottommostLevelCompaction, Debugger, RegionInfo};
-use tikv::storage::{Key, ALL_CFS, CF_DEFAULT, CF_LOCK, CF_WRITE};
+use tikv::storage::{Key, ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
 use tikv::util::rocksdb_util;
 use tikv::util::security::{self, SecurityConfig, SecurityManager};
 use tikv::util::{escape, unescape};
@@ -571,6 +574,8 @@ trait DebugExecutor {
     fn dump_metrics(&self, tags: Vec<&str>);
 
     fn dump_region_properties(&self, region_id: u64);
+
+    fn downgrade_from_v3_to_v2(&mut self, cfg: &TiKvConfig);
 }
 
 impl DebugExecutor for DebugClient {
@@ -702,11 +707,11 @@ impl DebugExecutor for DebugClient {
     }
 
     fn set_region_tombstone(&self, _: Vec<Region>) {
-        unimplemented!("only avaliable for local mode");
+        unimplemented!("only available for local mode");
     }
 
     fn recover_regions(&self, _: Vec<Region>, _: bool) {
-        unimplemented!("only avaliable for local mode");
+        unimplemented!("only available for local mode");
     }
 
     fn recover_all(&self, _: usize, _: bool) {
@@ -714,7 +719,7 @@ impl DebugExecutor for DebugClient {
     }
 
     fn print_bad_regions(&self) {
-        unimplemented!("only avaliable for local mode");
+        unimplemented!("only available for local mode");
     }
 
     fn remove_fail_stores(&self, _: Vec<u64>, _: Option<Vec<u64>>) {
@@ -752,6 +757,10 @@ impl DebugExecutor for DebugClient {
         for prop in resp.get_props() {
             v1!("{}: {}", prop.get_name(), prop.get_value());
         }
+    }
+
+    fn downgrade_from_v3_to_v2(&mut self, cfg: &TiKvConfig) {
+        unimplemented!("only available for local mode");
     }
 }
 
@@ -939,6 +948,63 @@ impl DebugExecutor for Debugger {
         for (name, value) in props {
             v1!("{}: {}", name, value);
         }
+    }
+
+    fn downgrade_from_v3_to_v2(&mut self, cfg: &TiKvConfig) {
+        let engines = self.get_engine_mut();
+        let kv_engine = Arc::get_mut(&mut engines.kv).unwrap();
+        let raft_engine = engines.raft.clone();
+
+        let start_key = keys::LOCAL_MIN_KEY;
+        let end_key = keys::LOCAL_MAX_KEY;
+        let raft_cf = kv_engine
+            .create_cf((CF_RAFT, cfg.rocksdb.raftcf.build_opt()))
+            .unwrap();
+        let kv_wb = WriteBatch::new();
+        let raft_wb = WriteBatch::new();
+
+        if let Some(m) = kv_engine
+            .get_msg::<StoreIdent>(keys::STORE_IDENT_KEY)
+            .unwrap()
+        {
+            v1!(
+                "downgrading STORE_IDENT_KEY [store_id={}, cluster_id={}]",
+                m.store_id,
+                m.cluster_id
+            );
+            kv_wb.put_msg(keys::STORE_IDENT_KEY, &m).unwrap();
+            raft_wb.delete(keys::STORE_IDENT_KEY).unwrap();
+        }
+
+        if let Some(m) = kv_engine
+            .get_msg::<Region>(keys::PREPARE_BOOTSTRAP_KEY)
+            .unwrap()
+        {
+            v1!("downgrading PREPARE_BOOTSTRAP_KEY [region={}]", ?m);
+            kv_wb.put_msg(keys::PREPARE_BOOTSTRAP_KEY, &m).unwrap();
+            raft_wb.delete(keys::PREPARE_BOOTSTRAP_KEY).unwrap();
+        }
+
+        raft_engine
+            .scan(start_key, end_key, false, |key, value| {
+                if let Ok((region_id, suffix)) = keys::decode_region_raft_key(key) {
+                    if suffix == keys::APPLY_STATE_SUFFIX {
+                        kv_wb.put_cf(raft_cf, key, value)?;
+                        v1!("downgrading apply state [region_id={}]", region_id);
+                    }
+                } else if let Ok((region_id, suffix)) = keys::decode_region_meta_key(key) {
+                    if suffix == keys::REGION_STATE_SUFFIX {
+                        kv_wb.put_cf(raft_cf, key, value)?;
+                        v1!("downgrading region state [region_id={}]", region_id);
+                    }
+                }
+                Ok(true)
+            })
+            .unwrap();
+        let mut sync_opt = WriteOptions::new();
+        sync_opt.set_sync(true);
+        raft_engine.write_opt(raft_wb, &sync_opt).unwrap();
+        kv_engine.write_opt(kv_wb, &sync_opt).unwrap();
     }
 }
 
@@ -1679,7 +1745,8 @@ fn main() {
                         .default_value("1024")
                         .help("the length"),
                 ),
-        );
+        )
+        .subcommand(SubCommand::with_name("downgrade").about("Downgrade TiKV from v2.x to v3.x."));
 
     let matches = app.clone().get_matches();
 
@@ -1769,7 +1836,7 @@ fn main() {
     let raft_db = matches.value_of("raftdb");
     let host = matches.value_of("host");
 
-    let debug_executor = new_debug_executor(db, raft_db, host, &cfg, Arc::clone(&mgr));
+    let mut debug_executor = new_debug_executor(db, raft_db, host, &cfg, Arc::clone(&mgr));
 
     if let Some(matches) = matches.subcommand_matches("print") {
         let cf = matches.value_of("cf").unwrap();
@@ -1992,6 +2059,8 @@ fn main() {
             let resp = client.list_fail_points_opt(&list_req, option).unwrap();
             v1!("{:?}", resp.get_entries());
         }
+    } else if matches.subcommand_matches("downgrade").is_some() {
+        debug_executor.downgrade_from_v3_to_v2(&cfg);
     } else {
         let _ = app.print_help();
     }
@@ -2221,6 +2290,7 @@ fn run_ldb_command(cmd: &ArgMatches<'_>, cfg: &TiKvConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempdir::TempDir;
 
     #[test]
     fn test_from_hex() {
@@ -2235,4 +2305,7 @@ mod tests {
         assert_eq!(gen_random_bytes(8).len(), 8);
         assert_eq!(gen_random_bytes(0).len(), 0);
     }
+
+    #[test]
+    fn test_downgrade_from_v3_to_v2() {}
 }

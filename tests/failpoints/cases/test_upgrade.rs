@@ -30,7 +30,7 @@ use tikv::storage::{ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
 use tikv::util::rocksdb_util;
 
 const CLUSTER_ID: u64 = 1_000_000_000;
-const STOER_ID: u64 = 1;
+const STORE_ID: u64 = 1;
 const REGION_ID: u64 = 3;
 const PEER_ID: u64 = 4;
 

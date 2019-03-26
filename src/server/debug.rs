@@ -146,6 +146,10 @@ impl Debugger {
         Debugger { engines }
     }
 
+    pub fn get_engine_mut(&mut self) -> &mut Engines {
+        &mut self.engines
+    }
+
     pub fn get_engine(&self) -> &Engines {
         &self.engines
     }
