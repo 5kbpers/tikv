@@ -751,9 +751,9 @@ impl Peer {
 
     #[inline]
     fn send<T, I>(&mut self, trans: &mut T, msgs: I, metrics: &mut RaftMessageMetrics)
-    where
-        T: Transport,
-        I: IntoIterator<Item = eraftpb::Message>,
+        where
+            T: Transport,
+            I: IntoIterator<Item=eraftpb::Message>,
     {
         for msg in msgs {
             let msg_type = msg.get_msg_type();
@@ -769,6 +769,7 @@ impl Peer {
                 MessageType::MsgHeartbeat => metrics.heartbeat += 1,
                 MessageType::MsgHeartbeatResponse => metrics.heartbeat_resp += 1,
                 MessageType::MsgTransferLeader => metrics.transfer_leader += 1,
+                MessageType::MsgReadIndex => metrics.read_index += 1,
                 MessageType::MsgTimeoutNow => {
                     // After a leader transfer procedure is triggered, the lease for
                     // the old leader may be expired earlier than usual, since a new leader
@@ -789,7 +790,6 @@ impl Peer {
                 | MessageType::MsgUnreachable
                 | MessageType::MsgSnapStatus
                 | MessageType::MsgCheckQuorum
-                | MessageType::MsgReadIndex
                 | MessageType::MsgReadIndexResp => {}
             }
         }
@@ -977,14 +977,14 @@ impl Peer {
                 StaleState::ToValidate
             }
             Some(instant)
-                if instant.elapsed() >= ctx.cfg.abnormal_leader_missing_duration.0
-                    && !naive_peer =>
-            {
-                // A peer is considered as in the leader missing state
-                // if it's initialized but is isolated from its leader or
-                // something bad happens that the raft group can not elect a leader.
-                StaleState::LeaderMissing
-            }
+            if instant.elapsed() >= ctx.cfg.abnormal_leader_missing_duration.0
+                && !naive_peer =>
+                {
+                    // A peer is considered as in the leader missing state
+                    // if it's initialized but is isolated from its leader or
+                    // something bad happens that the raft group can not elect a leader.
+                    StaleState::LeaderMissing
+                }
             _ => StaleState::Valid,
         }
     }
@@ -1150,8 +1150,8 @@ impl Peer {
             // version is not larger than now, we can make sure there is no overlap.
             if region.get_region_epoch().get_version()
                 > meta.regions[&region.get_id()]
-                    .get_region_epoch()
-                    .get_version()
+                .get_region_epoch()
+                .get_version()
             {
                 // For merge process, when applying snapshot or create new peer the stale source
                 // peer is destroyed asynchronously. So here checks whether there is any overlap, if
@@ -1716,8 +1716,8 @@ impl Peer {
     ///    If a snapshot is involved between it and the Raft leader, it's not healthy since
     ///    it cannot works as a node in the quorum to receive replicating logs from leader.
     fn count_healthy_node<'a, I>(&self, progress: I) -> usize
-    where
-        I: Iterator<Item = &'a Progress>,
+        where
+            I: Iterator<Item=&'a Progress>,
     {
         let mut healthy = 0;
         for pr in progress {
@@ -1861,7 +1861,7 @@ impl Peer {
         // on applied. TODO: fix the transfer leader issue in Raft.
         if self.raft_group.raft.has_pending_conf()
             || duration_to_sec(self.recent_conf_change_time.elapsed())
-                < ctx.cfg.raft_reject_transfer_leader_duration.as_secs() as f64
+            < ctx.cfg.raft_reject_transfer_leader_duration.as_secs() as f64
         {
             debug!(
                 "reject transfer leader due to the region was config changed recently";
@@ -2266,7 +2266,7 @@ impl Peer {
             check_epoch,
             false, /* we don't need snapshot time */
         )
-        .execute(&req, self.region(), read_index);
+            .execute(&req, self.region(), read_index);
 
         cmd_resp::bind_term(&mut resp.response, self.term());
         resp
@@ -2645,7 +2645,7 @@ impl ReadExecutor {
                         res.set_read_index(read_index);
                         resp.set_read_index(res);
                     } else {
-                        panic!("[region {}] can not get readindex", region.get_id(),);
+                        panic!("[region {}] can not get readindex", region.get_id(), );
                     }
                     resp
                 }
