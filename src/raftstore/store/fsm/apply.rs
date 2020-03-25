@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 use std::{cmp, usize};
 
 use crossbeam::channel::{TryRecvError, TrySendError};
@@ -384,6 +386,7 @@ impl ApplyContext {
                 .unwrap_or_else(|e| {
                     panic!("failed to write to engine: {:?}", e);
                 });
+            thread::sleep(Duration::from_millis(10));
             self.sync_log_hint = false;
             let data_size = self.kv_wb().data_size();
             if data_size > APPLY_WB_SHRINK_SIZE {
