@@ -9,6 +9,7 @@ use super::router::{BasicMailbox, Router};
 use crossbeam::channel::{self, SendError, TryRecvError};
 use std::borrow::Cow;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 use tikv_util::mpsc;
 
 /// `FsmScheduler` schedules `Fsm` for later handles.
@@ -406,7 +407,12 @@ where
             };
             let t = thread::Builder::new()
                 .name(thd_name!(format!("{}-{}", name_prefix, i)))
-                .spawn(move || poller.poll())
+                .spawn(move || {
+                    if i % 2 == 0 {
+                        thread::sleep(Duration::from_secs(600));
+                    }
+                    poller.poll()
+                })
                 .unwrap();
             self.workers.push(t);
         }
