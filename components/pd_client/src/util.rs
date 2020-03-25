@@ -439,6 +439,7 @@ fn connect(
     let delay = GLOBAL_TIMER_HANDLE
         .delay(Instant::now() + Duration::from_secs(REQUEST_TIMEOUT))
         .then(|_| {
+            error!("get members timeout");
             Err(grpcio::Error::RpcFailure(grpcio::RpcStatus::new(
                 grpcio::RpcStatusCode::UNAVAILABLE,
                 None,

@@ -585,6 +585,7 @@ impl PdClient for RpcClient {
             let cli = client.read().unwrap();
             let (req_sink, resp_stream) = cli.client_stub.tso().unwrap();
             let (keep_req_tx, mut keep_req_rx) = oneshot::channel();
+            info!("send tso request"; "req" => ?req);
             let send_once = req_sink.send((req, WriteFlags::default())).then(|s| {
                 let _ = keep_req_tx.send(s);
                 Ok(())
@@ -597,6 +598,7 @@ impl PdClient for RpcClient {
                     .and_then(move |(resp, _)| {
                         // Now we can safely drop sink without
                         // causing a Cancel error.
+                        info!("receive tso response"; "resp" => ?resp);
                         let _ = keep_req_rx.try_recv().unwrap();
                         let resp = match resp {
                             Some(r) => r,
