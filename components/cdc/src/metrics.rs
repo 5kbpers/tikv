@@ -36,4 +36,9 @@ lazy_static! {
         "Total number of CDC captured regions"
     )
     .unwrap();
+    pub static ref CDC_SCAN_YIELD_COUNT: IntCounter = register_int_counter!(
+        "tikv_cdc_scan_yield_count",
+        "Number of thread yield on sending scan result"
+    )
+    .unwrap();
 }

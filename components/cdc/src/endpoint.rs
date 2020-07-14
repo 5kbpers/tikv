@@ -29,7 +29,10 @@ use txn_types::{Key, Lock, LockType, TimeStamp};
 use crate::delegate::{Delegate, Downstream, DownstreamID, DownstreamState};
 use crate::metrics::*;
 use crate::service::{Conn, ConnID};
+use crate::token::{Token, TokenLimiter};
 use crate::{CdcObserver, Error, Result};
+
+const DEFAULT_SCAN_TOKENS: usize = 16;
 
 pub enum Deregister {
     Downstream {
@@ -114,6 +117,7 @@ pub enum Task {
         region_id: u64,
         downstream_id: DownstreamID,
         entries: Vec<Option<TxnEntry>>,
+        entries_size: usize,
     },
     RegisterMinTsEvent,
     // The result of ChangeCmd should be returned from CDC Endpoint to ensure
@@ -181,11 +185,13 @@ impl fmt::Debug for Task {
                 ref region_id,
                 ref downstream_id,
                 ref entries,
+                ref entries_size,
             } => de
                 .field("type", &"incremental_scan")
                 .field("region_id", &region_id)
                 .field("downstream", &downstream_id)
                 .field("scan_entries", &entries.len())
+                .field("scan_entries_size", &entries_size)
                 .finish(),
             Task::RegisterMinTsEvent => de.field("type", &"register_min_ts").finish(),
             Task::InitDownstream {
@@ -218,6 +224,8 @@ pub struct Endpoint<T> {
 
     min_resolved_ts: TimeStamp,
     min_ts_region_id: u64,
+
+    limiter: TokenLimiter,
 }
 
 impl<T: 'static + RaftStoreRouter<RocksSnapshot>> Endpoint<T> {
@@ -239,6 +247,7 @@ impl<T: 'static + RaftStoreRouter<RocksSnapshot>> Endpoint<T> {
             workers,
             raft_router,
             observer,
+            limiter: TokenLimiter::new(DEFAULT_SCAN_TOKENS),
             scan_batch_size: 1024,
             min_ts_interval: Duration::from_secs(1),
             min_resolved_ts: TimeStamp::max(),
@@ -407,6 +416,7 @@ impl<T: 'static + RaftStoreRouter<RocksSnapshot>> Endpoint<T> {
             downstream_state: downstream_state.clone(),
             checkpoint_ts: checkpoint_ts.into(),
             build_resolver: is_new_delegate,
+            limiter: self.limiter.clone(),
         };
         if !delegate.subscribe(downstream) {
             conn.unsubscribe(request.get_region_id());
@@ -519,6 +529,7 @@ impl<T: 'static + RaftStoreRouter<RocksSnapshot>> Endpoint<T> {
         } else {
             warn!("region not found on incremental scan"; "region_id" => region_id);
         }
+        let _ = self.limiter.put(Token);
     }
 
     fn on_region_ready(&mut self, observe_id: ObserveID, resolver: Resolver, region: Region) {
@@ -628,6 +639,7 @@ impl<T: 'static + RaftStoreRouter<RocksSnapshot>> Endpoint<T> {
 
 struct Initializer {
     sched: Scheduler<Task>,
+    limiter: TokenLimiter,
 
     region_id: u64,
     observe_id: ObserveID,
@@ -697,9 +709,15 @@ impl Initializer {
                     "observe_id" => ?self.observe_id);
                 return;
             }
-            let entries = match Self::scan_batch(&mut scanner, self.batch_size, resolver.as_mut()) {
+            let token = self.limiter.get().unwrap();
+            let (entries, entries_size) = match Self::scan_batch(
+                &mut scanner,
+                self.batch_size,
+                resolver.as_mut(),
+            ) {
                 Ok(res) => res,
                 Err(e) => {
+                    let _ = self.limiter.put(token);
                     error!("cdc scan entries failed"; "error" => ?e, "region_id" => region_id);
                     // TODO: record in metrics.
                     let deregister = Deregister::Downstream {
@@ -724,8 +742,10 @@ impl Initializer {
                 region_id,
                 downstream_id,
                 entries,
+                entries_size,
             };
             if let Err(e) = self.sched.schedule(scanned) {
+                let _ = self.limiter.put(token);
                 error!("schedule cdc task failed"; "error" => ?e, "region_id" => region_id);
                 return;
             }
@@ -742,11 +762,13 @@ impl Initializer {
         scanner: &mut DeltaScanner<S>,
         batch_size: usize,
         resolver: Option<&mut Resolver>,
-    ) -> Result<Vec<Option<TxnEntry>>> {
+    ) -> Result<(Vec<Option<TxnEntry>>, usize)> {
+        let mut size = 0;
         let mut entries = Vec::with_capacity(batch_size);
         while entries.len() < entries.capacity() {
             match scanner.next_entry()? {
                 Some(entry) => {
+                    size += entry.bytes();
                     entries.push(Some(entry));
                 }
                 None => {
@@ -771,7 +793,7 @@ impl Initializer {
             }
         }
 
-        Ok(entries)
+        Ok((entries, size))
     }
 
     fn finish_building_resolver(
@@ -829,7 +851,9 @@ impl<T: 'static + RaftStoreRouter<RocksSnapshot>> Runnable<Task> for Endpoint<T>
                 region_id,
                 downstream_id,
                 entries,
+                entries_size,
             } => {
+                CDC_PENDING_BYTES_GAUGE.sub(entries_size as i64);
                 self.on_incremental_scan(region_id, downstream_id, entries);
             }
             Task::MultiBatch { multi } => self.on_multi_batch(multi),

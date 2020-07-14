@@ -162,6 +162,17 @@ impl TxnEntry {
             _ => unreachable!(),
         }
     }
+
+    pub fn bytes(&self) -> usize {
+        match self {
+            Self::Prewrite { default, lock, .. } => {
+                default.0.len() + default.1.len() + lock.0.len() + lock.1.len()
+            }
+            Self::Commit { default, write, .. } => {
+                default.0.len() + default.1.len() + write.0.len() + write.1.len()
+            }
+        }
+    }
 }
 
 /// A batch of transaction entries.
