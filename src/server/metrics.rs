@@ -351,6 +351,12 @@ lazy_static! {
         "Total CPU cores quota for TiKV server"
     )
     .unwrap();
+    pub static ref ASYNC_WRITE_SIZE_VEC: IntCounterVec = register_int_counter_vec!(
+        "tikv_server_raftkv_async_write_size",
+        "Total size of data written through raftkv async write",
+        &["cf"]
+    )
+    .unwrap();
 }
 
 make_auto_flush_static_metric! {
