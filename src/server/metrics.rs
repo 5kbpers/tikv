@@ -196,20 +196,31 @@ lazy_static! {
         &["cf", "tag"]
     )
     .unwrap();
-    pub static ref GRPC_MSG_HISTOGRAM_VEC: HistogramVec = register_histogram_vec!(
+    pub static ref GRPC_MSG_DURATION_HISTOGRAM_VEC: HistogramVec = register_histogram_vec!(
         "tikv_grpc_msg_duration_seconds",
         "Bucketed histogram of grpc server messages",
         &["type"],
         exponential_buckets(0.0005, 2.0, 20).unwrap()
     )
     .unwrap();
+    pub static ref GRPC_MSG_SIZE_HISTOGRAM_VEC: HistogramVec = register_histogram_vec!(
+        "tikv_grpc_msg_size",
+        "Bucketed histogram of the size of grpc server messages",
+        &["type"],
+        exponential_buckets(1.0, 2.0, 10).unwrap()
+    )
+    .unwrap();
 }
 
 lazy_static! {
-    pub static ref GRPC_MSG_HISTOGRAM_STATIC: GrpcMsgHistogramVec =
-        auto_flush_from!(GRPC_MSG_HISTOGRAM_VEC, GrpcMsgHistogramVec);
-    pub static ref GRPC_MSG_HISTOGRAM_GLOBAL: GrpcMsgHistogramGlobal =
-        GrpcMsgHistogramGlobal::from(&GRPC_MSG_HISTOGRAM_VEC);
+    pub static ref GRPC_MSG_DURATION_HISTOGRAM_STATIC: GrpcMsgHistogramVec =
+        auto_flush_from!(GRPC_MSG_DURATION_HISTOGRAM_VEC, GrpcMsgHistogramVec);
+    pub static ref GRPC_MSG_DURATION_HISTOGRAM_GLOBAL: GrpcMsgHistogramGlobal =
+        GrpcMsgHistogramGlobal::from(&GRPC_MSG_DURATION_HISTOGRAM_VEC);
+    pub static ref GRPC_MSG_SIZE_HISTOGRAM_STATIC: GrpcMsgHistogramVec =
+        auto_flush_from!(GRPC_MSG_SIZE_HISTOGRAM_VEC, GrpcMsgHistogramVec);
+    pub static ref GRPC_MSG_SIZE_HISTOGRAM_GLOBAL: GrpcMsgHistogramGlobal =
+        GrpcMsgHistogramGlobal::from(&GRPC_MSG_SIZE_HISTOGRAM_VEC);
     pub static ref GC_COMMAND_COUNTER_VEC_STATIC: GcCommandCounterVec =
         auto_flush_from!(GC_COMMAND_COUNTER_VEC, GcCommandCounterVec);
     pub static ref SNAP_TASK_COUNTER_STATIC: SnapTaskCounterVec =

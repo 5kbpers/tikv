@@ -35,6 +35,7 @@ use kvproto::kvrpcpb::*;
 use kvproto::raft_cmdpb::{CmdType, RaftCmdRequest, RaftRequestHeader, Request as RaftRequest};
 use kvproto::raft_serverpb::*;
 use kvproto::tikvpb::*;
+use protobuf::Message;
 use raftstore::router::RaftStoreRouter;
 use raftstore::store::{Callback, CasualMessage};
 use raftstore::{DiscardReason, Error as RaftStoreError};
@@ -125,13 +126,17 @@ macro_rules! handle_request {
             }
             let begin_instant = Instant::now_coarse();
 
+            let size = req.compute_size();
             let resp = $future_name(&self.storage, req);
             let task = async move {
                 let resp = resp.await?;
                 sink.success(resp).await?;
-                GRPC_MSG_HISTOGRAM_STATIC
+                GRPC_MSG_DURATION_HISTOGRAM_STATIC
                     .$fn_name
                     .observe(duration_to_sec(begin_instant.elapsed()));
+                GRPC_MSG_SIZE_HISTOGRAM_STATIC
+                    .$fn_name
+                    .observe(size as f64);
                 ServerResult::Ok(())
             }
             .map_err(|e| {
@@ -294,7 +299,7 @@ impl<T: RaftStoreRouter<RocksEngine> + 'static, E: Engine, L: LockManager> Tikv
         let task = async move {
             let resp = future.await?;
             sink.success(resp).await?;
-            GRPC_MSG_HISTOGRAM_STATIC
+            GRPC_MSG_DURATION_HISTOGRAM_STATIC
                 .coprocessor
                 .observe(duration_to_sec(begin_instant.elapsed()));
             ServerResult::Ok(())
@@ -337,7 +342,7 @@ impl<T: RaftStoreRouter<RocksEngine> + 'static, E: Engine, L: LockManager> Tikv
                 resp.set_error(format!("{}", e));
             }
             sink.success(resp).await?;
-            GRPC_MSG_HISTOGRAM_STATIC
+            GRPC_MSG_DURATION_HISTOGRAM_STATIC
                 .register_lock_observer
                 .observe(duration_to_sec(begin_instant.elapsed()));
             ServerResult::Ok(())
@@ -384,7 +389,7 @@ impl<T: RaftStoreRouter<RocksEngine> + 'static, E: Engine, L: LockManager> Tikv
                 Err(e) => resp.set_error(format!("{}", e)),
             }
             sink.success(resp).await?;
-            GRPC_MSG_HISTOGRAM_STATIC
+            GRPC_MSG_DURATION_HISTOGRAM_STATIC
                 .check_lock_observer
                 .observe(duration_to_sec(begin_instant.elapsed()));
             ServerResult::Ok(())
@@ -425,7 +430,7 @@ impl<T: RaftStoreRouter<RocksEngine> + 'static, E: Engine, L: LockManager> Tikv
                 resp.set_error(format!("{}", e));
             }
             sink.success(resp).await?;
-            GRPC_MSG_HISTOGRAM_STATIC
+            GRPC_MSG_DURATION_HISTOGRAM_STATIC
                 .remove_lock_observer
                 .observe(duration_to_sec(begin_instant.elapsed()));
             ServerResult::Ok(())
@@ -473,7 +478,7 @@ impl<T: RaftStoreRouter<RocksEngine> + 'static, E: Engine, L: LockManager> Tikv
                 Err(e) => resp.set_error(format!("{}", e)),
             }
             sink.success(resp).await?;
-            GRPC_MSG_HISTOGRAM_STATIC
+            GRPC_MSG_DURATION_HISTOGRAM_STATIC
                 .physical_scan_lock
                 .observe(duration_to_sec(begin_instant.elapsed()));
             ServerResult::Ok(())
@@ -525,7 +530,7 @@ impl<T: RaftStoreRouter<RocksEngine> + 'static, E: Engine, L: LockManager> Tikv
                 resp.set_error(format!("{}", e));
             }
             sink.success(resp).await?;
-            GRPC_MSG_HISTOGRAM_STATIC
+            GRPC_MSG_DURATION_HISTOGRAM_STATIC
                 .unsafe_destroy_range
                 .observe(duration_to_sec(begin_instant.elapsed()));
             ServerResult::Ok(())
@@ -565,7 +570,7 @@ impl<T: RaftStoreRouter<RocksEngine> + 'static, E: Engine, L: LockManager> Tikv
         let future = async move {
             match sink.send_all(&mut stream).await.map_err(Error::from) {
                 Ok(_) => {
-                    GRPC_MSG_HISTOGRAM_STATIC
+                    GRPC_MSG_DURATION_HISTOGRAM_STATIC
                         .coprocessor_stream
                         .observe(duration_to_sec(begin_instant.elapsed()));
                     let _ = sink.close().await;
@@ -744,7 +749,7 @@ impl<T: RaftStoreRouter<RocksEngine> + 'static, E: Engine, L: LockManager> Tikv
                 }
             }
             sink.success(resp).await?;
-            GRPC_MSG_HISTOGRAM_STATIC
+            GRPC_MSG_DURATION_HISTOGRAM_STATIC
                 .split_region
                 .observe(duration_to_sec(begin_instant.elapsed()));
             ServerResult::Ok(())
@@ -852,7 +857,7 @@ impl<T: RaftStoreRouter<RocksEngine> + 'static, E: Engine, L: LockManager> Tikv
                 }
             }
             sink.success(resp).await?;
-            GRPC_MSG_HISTOGRAM_STATIC
+            GRPC_MSG_DURATION_HISTOGRAM_STATIC
                 .read_index
                 .observe(begin_instant.elapsed_secs());
             ServerResult::Ok(())
@@ -1017,7 +1022,7 @@ fn response_batch_commands_request<F>(
             if tx.send_and_notify((id, resp)).is_err() {
                 error!("KvService response batch commands fail");
             } else {
-                GRPC_MSG_HISTOGRAM_STATIC
+                GRPC_MSG_DURATION_HISTOGRAM_STATIC
                     .get(label_enum)
                     .observe(begin_instant.elapsed_secs());
             }
