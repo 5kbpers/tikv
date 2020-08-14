@@ -67,6 +67,7 @@ struct ServerMeta {
     raw_apply_router: ApplyRouter<RocksEngine>,
     worker: Worker<ResolveTask>,
     gc_worker: GcWorker<RaftKv<SimulateStoreTransport>>,
+    old_value_cache: txn_types::OldValueCache,
 }
 
 type PendingServices = Vec<Box<dyn Fn() -> Service>>;
@@ -128,6 +129,10 @@ impl ServerCluster {
         self.metas.get(&node_id).unwrap().sim_router.clone()
     }
 
+    pub fn get_old_value_cache(&self, node_id: u64) -> txn_types::OldValueCache {
+        self.metas.get(&node_id).unwrap().old_value_cache.clone()
+    }
+
     /// To trigger GC manually.
     pub fn get_gc_worker(&self, node_id: u64) -> &GcWorker<RaftKv<SimulateStoreTransport>> {
         &self.metas.get(&node_id).unwrap().gc_worker
@@ -163,7 +168,12 @@ impl Simulator for ServerCluster {
         let raft_router = ServerRaftStoreRouter::new(router.clone(), local_reader);
         let sim_router = SimulateTransport::new(raft_router.clone());
 
-        let raft_engine = RaftKv::new(sim_router.clone(), engines.kv.clone());
+        let old_value_cache = txn_types::OldValueCache::with_capacity(1024);
+        let raft_engine = RaftKv::new(
+            sim_router.clone(),
+            engines.kv.clone(),
+            old_value_cache.clone(),
+        );
 
         // Create coprocessor.
         let mut coprocessor_host = CoprocessorHost::new(router.clone());
@@ -184,7 +194,11 @@ impl Simulator for ServerCluster {
             raft_engine.clone(),
         ));
 
-        let engine = RaftKv::new(sim_router.clone(), engines.kv.clone());
+        let engine = RaftKv::new(
+            sim_router.clone(),
+            engines.kv.clone(),
+            old_value_cache.clone(),
+        );
 
         let mut gc_worker = GcWorker::new(
             engine.clone(),
@@ -362,6 +376,7 @@ impl Simulator for ServerCluster {
                 sim_trans: simulate_trans,
                 worker,
                 gc_worker,
+                old_value_cache,
             },
         );
         self.addrs.insert(node_id, format!("{}", addr));

@@ -33,9 +33,9 @@ use resolved_ts::Resolver;
 use tikv::storage::txn::TxnEntry;
 use tikv_util::collections::HashMap;
 use tikv_util::mpsc::batch::Sender as BatchSender;
-use txn_types::{Key, Lock, LockType, TimeStamp, WriteRef, WriteType};
+use txn_types::{Key, Lock, LockType, OldValueCache, TimeStamp, WriteRef, WriteType};
 
-use crate::endpoint::{OldValueCache, OldValueCallback};
+use crate::endpoint::OldValueCallback;
 use crate::metrics::*;
 use crate::service::ConnID;
 use crate::{Error, Result};

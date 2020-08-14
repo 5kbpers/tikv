@@ -134,6 +134,7 @@ impl TestSuite {
                 raft_router,
                 cdc_ob,
                 cluster.store_metas[id].clone(),
+                sim.get_old_value_cache(*id),
             );
             cdc_endpoint.set_min_ts_interval(Duration::from_millis(100));
             cdc_endpoint.set_scan_batch_size(2);

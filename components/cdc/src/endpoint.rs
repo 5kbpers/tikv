@@ -23,12 +23,11 @@ use tikv::storage::mvcc::{DeltaScanner, ScannerBuilder};
 use tikv::storage::txn::TxnEntry;
 use tikv::storage::txn::TxnEntryScanner;
 use tikv_util::collections::HashMap;
-use tikv_util::lru::LruCache;
 use tikv_util::time::Instant;
 use tikv_util::timer::{SteadyTimer, Timer};
 use tikv_util::worker::{Runnable, RunnableWithTimer, ScheduleError, Scheduler};
 use tokio_threadpool::{Builder, ThreadPool};
-use txn_types::{Key, Lock, LockType, MutationType, OldValue, TimeStamp, TxnExtra};
+use txn_types::{Key, Lock, LockType, OldValueCache, TimeStamp};
 
 use crate::delegate::{Delegate, Downstream, DownstreamID, DownstreamState};
 use crate::metrics::*;
@@ -91,7 +90,6 @@ impl fmt::Debug for Deregister {
 }
 
 type InitCallback = Box<dyn FnOnce() + Send>;
-pub(crate) type OldValueCache = LruCache<Key, (Option<OldValue>, MutationType)>;
 pub(crate) type OldValueCallback =
     Box<dyn FnMut(Key, &mut OldValueCache) -> Option<Vec<u8>> + Send>;
 
@@ -131,7 +129,6 @@ pub enum Task {
         downstream_state: Arc<AtomicCell<DownstreamState>>,
         cb: InitCallback,
     },
-    TxnExtra(TxnExtra),
     Validate(u64, Box<dyn FnOnce(Option<&Delegate>) + Send>),
 }
 
@@ -203,14 +200,12 @@ impl fmt::Debug for Task {
                 .field("type", &"init_downstream")
                 .field("downstream", &downstream_id)
                 .finish(),
-            Task::TxnExtra(_) => de.field("type", &"txn_extra").finish(),
             Task::Validate(region_id, _) => de.field("region_id", &region_id).finish(),
         }
     }
 }
 
 const METRICS_FLUSH_INTERVAL: u64 = 10_000; // 10s
-const OLD_VALUE_LRU_SIZE: usize = 1024;
 
 pub struct Endpoint<T> {
     capture_regions: HashMap<u64, Delegate>,
@@ -240,6 +235,7 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
         raft_router: T,
         observer: CdcObserver,
         store_meta: Arc<Mutex<StoreMeta>>,
+        old_value_cache: OldValueCache,
     ) -> Endpoint<T> {
         let workers = Builder::new().name_prefix("cdcwkr").pool_size(4).build();
         let tso_worker = Builder::new().name_prefix("tso").pool_size(1).build();
@@ -249,6 +245,7 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
             scheduler,
             pd_client,
             tso_worker,
+            old_value_cache,
             timer: SteadyTimer::default(),
             workers,
             raft_router,
@@ -258,7 +255,6 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
             min_ts_interval: Duration::from_secs(1),
             min_resolved_ts: TimeStamp::max(),
             min_ts_region_id: 0,
-            old_value_cache: LruCache::with_capacity(OLD_VALUE_LRU_SIZE),
         };
         ep.register_min_ts_event();
         ep
@@ -885,11 +881,6 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Runnable<Task> for Endpoint<T> {
                     .compare_and_swap(DownstreamState::Uninitialized, DownstreamState::Normal);
                 cb();
             }
-            Task::TxnExtra(txn_extra) => {
-                for (k, v) in txn_extra.old_values {
-                    self.old_value_cache.insert(k, v);
-                }
-            }
             Task::Validate(region_id, validate) => {
                 validate(self.capture_regions.get(&region_id));
             }
@@ -1075,6 +1066,7 @@ mod tests {
             raft_router.clone(),
             observer,
             Arc::new(Mutex::new(StoreMeta::new(0))),
+            OldValueCache::with_capacity(0),
         );
         let (tx, _rx) = batch::unbounded(1);
 
@@ -1132,6 +1124,7 @@ mod tests {
             raft_router,
             observer,
             Arc::new(Mutex::new(StoreMeta::new(0))),
+            OldValueCache::with_capacity(0),
         );
         let (tx, rx) = batch::unbounded(1);
 

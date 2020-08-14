@@ -7,6 +7,7 @@ use tikv_util::codec::bytes;
 use tikv_util::codec::bytes::BytesEncoder;
 use tikv_util::codec::number::{self, NumberEncoder};
 use tikv_util::collections::HashMap;
+use tikv_util::lru::ShardedLruCache;
 
 // Short value max len must <= 255.
 pub const SHORT_VALUE_MAX_LEN: usize = 255;
@@ -323,6 +324,7 @@ pub struct OldValue {
 // The value of the map will be None when the mutation is `Insert`.
 // MutationType is the type of mutation of the current write.
 pub type OldValues = HashMap<Key, (Option<OldValue>, MutationType)>;
+pub type OldValueCache = ShardedLruCache<Key, (Option<OldValue>, MutationType)>;
 
 // Extra data fields filled by kvrpcpb::ExtraOp.
 #[derive(Default, Debug, Clone)]

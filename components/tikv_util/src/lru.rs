@@ -4,6 +4,7 @@ use crate::collections::{HashMap, HashMapEntry};
 use std::hash::Hash;
 use std::mem::MaybeUninit;
 use std::ptr::{self, NonNull};
+use std::sync::{Arc, Mutex};
 
 struct Record<K> {
     prev: NonNull<Record<K>>,
@@ -238,6 +239,85 @@ unsafe impl<K: Send, V: Send> Send for LruCache<K, V> {}
 impl<K, V> Drop for LruCache<K, V> {
     fn drop(&mut self) {
         self.clear();
+    }
+}
+
+const NUM_SHARD_BITS: usize = 4;
+const NUM_SHARDS: usize = 1 << NUM_SHARD_BITS;
+
+#[derive(Clone)]
+pub struct ShardedLruCache<K, V> {
+    shards: Vec<Arc<Mutex<LruCache<K, V>>>>,
+    capacity: usize,
+}
+
+impl<K, V> ShardedLruCache<K, V> {
+    pub fn with_capacity(mut capacity: usize) -> Self {
+        if capacity == 0 {
+            capacity = 1;
+        }
+        let per_shard = (capacity + (NUM_SHARDS - 1)) / NUM_SHARDS;
+        let shards = (0..NUM_SHARDS)
+            .map(|_| Arc::new(Mutex::new(LruCache::with_capacity(per_shard))))
+            .collect();
+        Self { shards, capacity }
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.shards
+            .iter_mut()
+            .for_each(|s| s.lock().unwrap().clear());
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+impl<K, V> ShardedLruCache<K, V>
+where
+    K: Eq + Hash + Clone + std::fmt::Debug,
+    V: Clone,
+{
+    #[inline]
+    fn shard(key: &K) -> usize {
+        fxhash::hash(key) >> (std::mem::size_of::<usize>() * 8 - NUM_SHARD_BITS)
+    }
+
+    #[inline]
+    pub fn resize(&mut self, mut new_cap: usize) {
+        if new_cap == 0 {
+            new_cap = 1;
+        }
+        let per_shard = (new_cap + (NUM_SHARDS - 1)) / NUM_SHARDS;
+        self.shards
+            .iter_mut()
+            .for_each(|s| s.lock().unwrap().resize(per_shard));
+        self.capacity = new_cap;
+    }
+
+    #[inline]
+    pub fn insert(&mut self, key: K, value: V) {
+        self.shards[Self::shard(&key)]
+            .lock()
+            .unwrap()
+            .insert(key, value);
+    }
+
+    #[inline]
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        self.shards[Self::shard(key)].lock().unwrap().remove(key)
+    }
+
+    #[inline]
+    pub fn get(&mut self, key: &K) -> Option<V> {
+        self.shards[Self::shard(key)]
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
     }
 }
 

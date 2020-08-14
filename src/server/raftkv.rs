@@ -14,7 +14,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::io::Error as IoError;
 use std::result;
 use std::time::Duration;
-use txn_types::{Key, TxnExtra, Value};
+use txn_types::{Key, OldValueCache, Value};
 
 use super::metrics::*;
 use crate::storage::kv::{
@@ -108,6 +108,7 @@ impl From<RaftServerError> for KvError {
 pub struct RaftKv<S: RaftStoreRouter<RocksEngine> + 'static> {
     router: S,
     engine: RocksEngine,
+    pub old_value_cache: OldValueCache,
 }
 
 pub enum CmdRes {
@@ -164,8 +165,12 @@ fn on_read_result(
 
 impl<S: RaftStoreRouter<RocksEngine>> RaftKv<S> {
     /// Create a RaftKv using specified configuration.
-    pub fn new(router: S, engine: RocksEngine) -> RaftKv<S> {
-        RaftKv { router, engine }
+    pub fn new(router: S, engine: RocksEngine, old_value_cache: OldValueCache) -> RaftKv<S> {
+        RaftKv {
+            router,
+            engine,
+            old_value_cache,
+        }
     }
 
     fn new_request_header(&self, ctx: &Context) -> RaftRequestHeader {
@@ -208,7 +213,6 @@ impl<S: RaftStoreRouter<RocksEngine>> RaftKv<S> {
         &self,
         ctx: &Context,
         reqs: Vec<Request>,
-        txn_extra: TxnExtra,
         cb: Callback<CmdRes>,
     ) -> Result<()> {
         #[cfg(feature = "failpoints")]
@@ -238,8 +242,6 @@ impl<S: RaftStoreRouter<RocksEngine>> RaftKv<S> {
         let mut cmd = RaftCmdRequest::default();
         cmd.set_header(header);
         cmd.set_requests(reqs.into());
-
-        self.router.send_txn_extra(txn_extra)?;
 
         self.router
             .send_command(
@@ -361,7 +363,6 @@ impl<S: RaftStoreRouter<RocksEngine>> Engine for RaftKv<S> {
         self.exec_write_requests(
             ctx,
             reqs,
-            batch.extra,
             Box::new(move |(cb_ctx, res)| match res {
                 Ok(CmdRes::Resp(_)) => {
                     ASYNC_REQUESTS_COUNTER_VEC.write.success.inc();

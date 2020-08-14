@@ -65,6 +65,7 @@ use tikv_util::{
     time::Monitor,
     worker::{FutureWorker, Worker},
 };
+use txn_types::OldValueCache;
 
 /// Run a TiKV server. Returns when the server is shutdown by the user, in which
 /// case the server will be properly stopped.
@@ -394,7 +395,11 @@ impl TiKVServer {
             )),
         );
 
-        let engine = RaftKv::new(raft_router.clone(), engines.kv.clone());
+        let engine = RaftKv::new(
+            raft_router.clone(),
+            engines.kv.clone(),
+            OldValueCache::with_capacity(1024),
+        );
 
         self.engines = Some(Engines {
             engines,
@@ -606,6 +611,7 @@ impl TiKVServer {
             raft_router,
             cdc_ob,
             engines.store_meta.clone(),
+            engines.engine.old_value_cache.clone(),
         );
         let cdc_timer = cdc_endpoint.new_timer();
         cdc_worker
