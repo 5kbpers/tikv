@@ -8,6 +8,7 @@ mod btree_engine;
 mod cursor;
 mod perf_context;
 mod rocksdb_engine;
+mod skiplist_engine;
 mod stats;
 
 use std::cell::UnsafeCell;
