@@ -1,14 +1,14 @@
-use std::collections::Bound;
 use std::default::Default;
 use std::fmt::{self, Debug, Display, Formatter};
-use std::sync::Arc;
+use std::ops::Deref;
 
 use engine_skiplist::{
     SkiplistEngine as SkiplistDb, SkiplistEngineBuilder as SkiplistDbBuilder,
     SkiplistEngineIterator as SkiplistDbIterator, SkiplistSnapshot,
 };
 use engine_traits::{
-    CfName, IterOptions, Iterable, ReadOptions, SeekKey, SyncMutable, ALL_CFS, CF_DEFAULT,
+    CfName, IterOptions, Iterable, Iterator as _, KvEngine, Peekable, ReadOptions, SeekKey,
+    SyncMutable, ALL_CFS, CF_DEFAULT,
 };
 use kvproto::kvrpcpb::Context;
 use txn_types::{Key, Value};
@@ -22,12 +22,12 @@ use tikv_util::time::ThreadReadId;
 
 #[derive(Clone)]
 pub struct SkiplistEngine {
-    engine: Arc<SkiplistDb<Key, Value>>,
+    engine: SkiplistDb,
 }
 
 impl SkiplistEngine {
     pub fn new(cfs: &[CfName]) -> Self {
-        let engine = Arc::new(SkiplistDbBuilder::new("skiplist").cf_names(cfs).build());
+        let engine = SkiplistDbBuilder::new("skiplist").cf_names(cfs).build();
 
         Self { engine }
     }
@@ -40,6 +40,7 @@ impl Default for SkiplistEngine {
 }
 
 impl Engine for SkiplistEngine {
+    type Local = SkiplistDb;
     type Snap = SkiplistEngineSnapshot;
 
     fn kv_engine(&self) -> SkiplistDb {
@@ -47,11 +48,11 @@ impl Engine for SkiplistEngine {
     }
 
     fn snapshot_on_kv_engine(&self, _: &[u8], _: &[u8]) -> EngineResult<Self::Snap> {
-        unimplemented!();
+        unimplemented!()
     }
 
-    fn modify_on_kv_engine(&self, _: Vec<Modify>) -> EngineResult<()> {
-        unimplemented!();
+    fn modify_on_kv_engine(&self, modifies: Vec<Modify>) -> EngineResult<()> {
+        write_modifies(self, modifies)
     }
 
     fn async_write(
@@ -100,50 +101,42 @@ pub struct SkiplistEngineIterator {
     iter: SkiplistDbIterator,
 }
 
-impl SkiplistEngineIterator {
-    fn new(engine: Arc<SkiplistEngine>, opts: IterOptions) -> Self {
-        Self {
-            iter: engine.iterator_opt(opts),
-        }
-    }
-}
-
 impl Iterator for SkiplistEngineIterator {
     fn next(&mut self) -> EngineResult<bool> {
-        Ok(self.iter.next())
+        Ok(self.iter.next()?)
     }
 
     fn prev(&mut self) -> EngineResult<bool> {
-        Ok(self.iter.prev())
+        Ok(self.iter.prev()?)
     }
 
     fn seek(&mut self, key: &Key) -> EngineResult<bool> {
-        Ok(self.iter.seek(SeekKey::Key(key.as_encoded())))
+        Ok(self.iter.seek(SeekKey::Key(key.as_encoded()))?)
     }
 
     fn seek_for_prev(&mut self, key: &Key) -> EngineResult<bool> {
-        Ok(self.iter.seek_for_prev(SeekKey::Key(key.as_encoded())))
+        Ok(self.iter.seek_for_prev(SeekKey::Key(key.as_encoded()))?)
     }
 
     fn seek_to_first(&mut self) -> EngineResult<bool> {
-        Ok(self.iter.seek(SeekKey::Start))
+        Ok(self.iter.seek(SeekKey::Start)?)
     }
 
     fn seek_to_last(&mut self) -> EngineResult<bool> {
-        Ok(self.iter.seek(SeekKey::End))
+        Ok(self.iter.seek(SeekKey::End)?)
     }
 
     #[inline]
     fn valid(&self) -> EngineResult<bool> {
-        Ok(self.iter.valid())
+        Ok(self.iter.valid()?)
     }
 
     fn key(&self) -> &[u8] {
-        Ok(self.iter.key())
+        self.iter.key()
     }
 
     fn value(&self) -> &[u8] {
-        Ok(self.iter.value())
+        self.iter.value()
     }
 }
 
@@ -167,7 +160,10 @@ impl Snapshot for SkiplistEngineSnapshot {
         self.get_cf(CF_DEFAULT, key)
     }
     fn get_cf(&self, cf: CfName, key: &Key) -> EngineResult<Option<Value>> {
-        Ok(snap.get_cf(cf, key.as_encoded()))
+        Ok(self
+            .snap
+            .get_value_cf(cf, key.as_encoded())?
+            .map(|v| v.deref().to_vec()))
     }
     fn get_cf_opt(&self, _: ReadOptions, cf: CfName, key: &Key) -> EngineResult<Option<Value>> {
         self.get_cf(cf, key)
@@ -182,7 +178,10 @@ impl Snapshot for SkiplistEngineSnapshot {
         opts: IterOptions,
         mode: ScanMode,
     ) -> EngineResult<Cursor<Self::Iter>> {
-        Ok(Cursor::new(SkiplistEngineIterator::new(self, opts), mode))
+        let iter = SkiplistEngineIterator {
+            iter: self.snap.iterator_cf_opt(cf, opts)?,
+        };
+        Ok(Cursor::new(iter, mode))
     }
 }
 

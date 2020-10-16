@@ -629,6 +629,7 @@ version = "0.0.1"
 dependencies = [
  "criterion",
  "crossbeam-skiplist 0.0.0 (git+https://github.com/crossbeam-rs/crossbeam.git?tag=crossbeam-0.7.3)",
+ "fail 0.4.0",
  "futures 0.3.5",
  "parking_lot",
  "rand 0.7.3",
@@ -1126,6 +1127,7 @@ dependencies = [
  "engine_traits",
  "tikv_alloc",
  "tikv_util",
+ "txn_types",
 ]
 
 [[package]]
@@ -1194,6 +1196,7 @@ dependencies = [
  "slog-global",
  "tikv_alloc",
  "tikv_util",
+ "txn_types",
 ]
 
 [[package]]

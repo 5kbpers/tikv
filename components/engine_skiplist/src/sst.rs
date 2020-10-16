@@ -17,7 +17,7 @@ impl SstExt for SkiplistEngine {
 }
 
 pub struct SkiplistSstWriterBuilder {
-    cf: Option<CfName>,
+    cf: Option<String>,
 }
 
 impl SstWriterBuilder<SkiplistEngine> for SkiplistSstWriterBuilder {
@@ -27,8 +27,8 @@ impl SstWriterBuilder<SkiplistEngine> for SkiplistSstWriterBuilder {
     fn set_db(self, db: &SkiplistEngine) -> Self {
         self
     }
-    fn set_cf(mut self, cf: CfName) -> Self {
-        self.cf = Some(cf);
+    fn set_cf(mut self, cf: &str) -> Self {
+        self.cf = Some(cf.to_string());
         self
     }
     fn set_in_memory(self, in_memory: bool) -> Self {
@@ -40,7 +40,7 @@ impl SstWriterBuilder<SkiplistEngine> for SkiplistSstWriterBuilder {
 
     fn build(self, path: &str) -> Result<RocksSstWriter> {
         if let Some(cf) = self.cf {
-            RocksSstWriterBuilder::new().set_cf(cf).build(path)
+            RocksSstWriterBuilder::new().set_cf(&cf).build(path)
         } else {
             RocksSstWriterBuilder::new().build(path)
         }

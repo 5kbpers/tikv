@@ -1,7 +1,7 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 use crate::engine::SkiplistEngine;
-use engine_traits::{MiscExt, Range, Result, SyncMutable};
+use engine_traits::{DeleteStrategy, MiscExt, Range, Result, SyncMutable};
 use std::sync::atomic::Ordering;
 
 impl MiscExt for SkiplistEngine {
@@ -13,14 +13,11 @@ impl MiscExt for SkiplistEngine {
         Ok(())
     }
 
-    fn delete_files_in_range_cf(
-        &self,
-        cf: &str,
-        start_key: &[u8],
-        end_key: &[u8],
-        include_end: bool,
-    ) -> Result<()> {
-        self.delete_range_cf(cf, start_key, end_key)
+    fn delete_ranges_cf(&self, cf: &str, strategy: DeleteStrategy, ranges: &[Range]) -> Result<()> {
+        for r in ranges {
+            self.delete_range_cf(cf, r.start_key, r.end_key)?;
+        }
+        Ok(())
     }
 
     fn get_approximate_memtable_stats_cf(&self, cf: &str, range: &Range) -> Result<(u64, u64)> {
@@ -36,9 +33,11 @@ impl MiscExt for SkiplistEngine {
     }
 
     fn roughly_cleanup_ranges(&self, ranges: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
-        for range in ranges {
-            self.delete_all_in_range(range.0.as_slice(), range.1.as_slice(), false)?;
-        }
+        let ranges: Vec<Range> = ranges
+            .iter()
+            .map(|(start_key, end_key)| Range { start_key, end_key })
+            .collect();
+        self.delete_all_in_range(DeleteStrategy::DeleteByRange, &ranges)?;
         Ok(())
     }
 
@@ -64,25 +63,5 @@ impl MiscExt for SkiplistEngine {
 
     fn get_oldest_snapshot_sequence_number(&self) -> Option<u64> {
         Some(self.get_latest_sequence_number() + 1)
-    }
-
-    fn delete_blob_files_in_range_cf(
-        &self,
-        cf: &str,
-        start_key: &[u8],
-        end_key: &[u8],
-        include_end: bool,
-    ) -> Result<()> {
-        self.delete_range_cf(cf, start_key, end_key)
-    }
-
-    fn delete_all_in_range_cf(
-        &self,
-        cf: &str,
-        start_key: &[u8],
-        end_key: &[u8],
-        use_delete_range: bool,
-    ) -> Result<()> {
-        self.delete_range_cf(cf, start_key, end_key)
     }
 }

@@ -2,7 +2,7 @@ use crate::{SkiplistEngine, SkiplistWriteBatch};
 
 use engine_traits::{
     Error, Iterable, KvEngine, MiscExt, Mutable, Peekable, RaftEngine, RaftLogBatch, Result,
-    SyncMutable, WriteBatch, WriteBatchExt, WriteOptions, CF_DEFAULT, MAX_DELETE_BATCH_COUNT,
+    SyncMutable, WriteBatch, WriteBatchExt, WriteOptions, CF_DEFAULT,
 };
 use kvproto::raft_serverpb::RaftLocalState;
 use protobuf::Message;
@@ -185,12 +185,11 @@ impl RaftEngine for SkiplistEngine {
             }
         }
 
-        let mut raft_wb = self.write_batch_with_cap(MAX_DELETE_BATCH_COUNT);
+        let mut raft_wb = self.write_batch_with_cap(4 * 1024);
         for idx in from..to {
             let key = keys::raft_log_key(raft_group_id, idx);
             box_try!(raft_wb.delete(&key));
-            if raft_wb.data_size() >= MAX_DELETE_BATCH_COUNT {
-                // Avoid large write batch to reduce latency.
+            if raft_wb.count() >= Self::WRITE_BATCH_MAX_KEYS {
                 self.write(&raft_wb).unwrap();
                 raft_wb.clear();
             }

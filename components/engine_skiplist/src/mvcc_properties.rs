@@ -17,7 +17,7 @@ impl MvccPropertiesExt for SkiplistEngine {
         safe_point: TimeStamp,
         start_key: &[u8],
         end_key: &[u8],
-    ) -> Result<MvccProperties> {
+    ) -> Option<MvccProperties> {
         let engine = self.get_cf_engine(cf).unwrap();
         let range: Box<dyn Iterator<Item = Entry<Key, Value>>> = if end_key.is_empty() {
             Box::new(engine.range(RangeFrom {
@@ -77,6 +77,6 @@ impl MvccPropertiesExt for SkiplistEngine {
                 _ => {}
             }
         }
-        Ok(props)
+        Some(props)
     }
 }
