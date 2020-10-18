@@ -28,6 +28,7 @@ pub use self::btree_engine::{BTreeEngine, BTreeEngineIterator, BTreeEngineSnapsh
 pub use self::cursor::{Cursor, CursorBuilder};
 pub use self::perf_context::{PerfStatisticsDelta, PerfStatisticsInstant};
 pub use self::rocksdb_engine::{write_modifies, RocksEngine, RocksSnapshot, TestEngineBuilder};
+pub use self::skiplist_engine::{SkiplistEngine, SkiplistEngineIterator, SkiplistEngineSnapshot};
 pub use self::stats::{
     CfStatistics, FlowStatistics, FlowStatsReporter, Statistics, StatisticsSummary,
 };

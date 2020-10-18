@@ -191,6 +191,7 @@ members = [
   "fuzz/fuzzer-honggfuzz",
   "tests",
   "cmd",
+  "test_cmd",
   "components/test_raftstore",
   "components/test_storage",
   "components/test_coprocessor",
@@ -229,7 +230,7 @@ members = [
   "components/error_code",
   "components/concurrency_manager",
 ]
-default-members = ["cmd"]
+default-members = ["test_cmd"]
 
 [profile.dev]
 opt-level = 0
