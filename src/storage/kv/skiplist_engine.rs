@@ -48,7 +48,7 @@ impl Engine for SkiplistEngine {
     }
 
     fn snapshot_on_kv_engine(&self, _: &[u8], _: &[u8]) -> EngineResult<Self::Snap> {
-        unimplemented!()
+        Ok(SkiplistEngineSnapshot::new(self))
     }
 
     fn modify_on_kv_engine(&self, modifies: Vec<Modify>) -> EngineResult<()> {
@@ -76,10 +76,7 @@ impl Engine for SkiplistEngine {
         _: Option<ThreadReadId>,
         cb: EngineCallback<Self::Snap>,
     ) -> EngineResult<()> {
-        cb((
-            CbContext::new(),
-            Ok(SkiplistEngineSnapshot::new(self.clone())),
-        ));
+        cb((CbContext::new(), Ok(SkiplistEngineSnapshot::new(self))));
         Ok(())
     }
 }
@@ -146,7 +143,7 @@ pub struct SkiplistEngineSnapshot {
 }
 
 impl SkiplistEngineSnapshot {
-    pub fn new(e: SkiplistEngine) -> Self {
+    pub fn new(e: &SkiplistEngine) -> Self {
         Self {
             snap: e.engine.snapshot(),
         }
