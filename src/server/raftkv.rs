@@ -18,6 +18,7 @@ use kvproto::raft_cmdpb::{
     RaftRequestHeader, Request, Response,
 };
 use kvproto::{errorpb, metapb};
+use protobuf::Message;
 use txn_types::{Key, TimeStamp, TxnExtraScheduler, Value};
 
 use super::metrics::*;
@@ -256,6 +257,7 @@ where
         let mut cmd = RaftCmdRequest::default();
         cmd.set_header(header);
         cmd.set_requests(reqs.into());
+        RAFTKV_WRITE_SIZE.inc_by(cmd.compute_size() as i64);
 
         self.router
             .send_command(

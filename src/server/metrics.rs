@@ -425,6 +425,11 @@ lazy_static! {
         exponential_buckets(0.0005, 2.0, 20).unwrap()
     )
     .unwrap();
+    pub static ref RAFTKV_WRITE_SIZE: IntCounter = register_int_counter!(
+        "tikv_storage_raftkv_write_size",
+        "Total size of asynchronous write requests"
+    )
+    .unwrap();
 }
 
 lazy_static! {
