@@ -667,6 +667,8 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport, C: PdClient> RaftPoller<EK, ER,
                 |_| {}
             );
 
+            RAFTDB_WRITE_SIZE.observe(self.poll_ctx.raft_wb.size() as f64);
+
             self.poll_ctx
                 .engines
                 .raft

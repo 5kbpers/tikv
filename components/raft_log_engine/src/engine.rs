@@ -62,6 +62,10 @@ impl RaftLogBatchTrait for RaftLogBatch {
     fn is_empty(&self) -> bool {
         self.0.items.is_empty()
     }
+
+    fn size(&self) -> usize {
+        0
+    }
 }
 
 impl RaftEngine for RaftLogEngine {

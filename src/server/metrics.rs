@@ -352,7 +352,7 @@ lazy_static! {
     )
     .unwrap();
     pub static ref ASYNC_WRITE_SIZE_VEC: IntCounterVec = register_int_counter_vec!(
-        "tikv_server_raftkv_async_write_size",
+        "tikv_storage_engine_async_request_write_size",
         "Total size of data written through raftkv async write",
         &["cf"]
     )

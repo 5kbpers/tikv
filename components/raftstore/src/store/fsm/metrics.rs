@@ -11,6 +11,12 @@ lazy_static! {
         exponential_buckets(1.0, 2.0, 20).unwrap()
     )
     .unwrap();
+    pub static ref RAFTDB_WRITE_SIZE: Histogram = register_histogram!(
+        "tikv_raftstore_raftdb_write_size",
+        "Bytes written to raftdb",
+        exponential_buckets(1.0, 2.0, 20).unwrap()
+    )
+    .unwrap();
 }
 
 #[derive(Default)]

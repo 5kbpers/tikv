@@ -58,7 +58,7 @@ impl WriteBatchExt for RocksEngine {
 
 pub struct RocksWriteBatch {
     db: Arc<DB>,
-    wb: RawWriteBatch,
+    pub(crate) wb: RawWriteBatch,
 }
 
 impl RocksWriteBatch {

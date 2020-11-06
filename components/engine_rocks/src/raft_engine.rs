@@ -250,6 +250,10 @@ impl RaftLogBatch for RocksWriteBatch {
     fn is_empty(&self) -> bool {
         Mutable::is_empty(self)
     }
+
+    fn size(&self) -> usize {
+        self.wb.data_size()
+    }
 }
 
 impl RocksWriteBatch {
