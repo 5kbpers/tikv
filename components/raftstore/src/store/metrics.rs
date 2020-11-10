@@ -476,4 +476,9 @@ lazy_static! {
             "The number of pending entries in the channel of apply FSMs."
     )
     .unwrap();
+    pub static ref RAFT_APPEND_ENTRIES_COUNTER: IntCounter = register_int_counter!(
+        "tikv_raftstore_append_entries",
+        "Total count of appended entries"
+    )
+    .unwrap();
 }

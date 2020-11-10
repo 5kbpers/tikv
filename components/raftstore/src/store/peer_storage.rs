@@ -1016,6 +1016,8 @@ where
         // TODO: save a copy here.
         ready_ctx.raft_wb_mut().append_slice(region_id, entries)?;
 
+        RAFT_APPEND_ENTRIES_COUNTER.inc_by(entries.len() as i64);
+
         if let Some(ref mut cache) = self.cache {
             // TODO: if the writebatch is failed to commit, the cache will be wrong.
             cache.append(&self.tag, entries);
