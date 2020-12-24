@@ -14,5 +14,6 @@ mod metrics;
 mod observer;
 mod resolver;
 mod scanner;
+mod sinker;
 
 pub use resolver::Resolver;

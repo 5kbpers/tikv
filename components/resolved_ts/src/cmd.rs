@@ -1,6 +1,9 @@
 use collections::HashMap;
-use kvproto::raft_cmdpb::{CmdType, Request};
-use raftstore::coprocessor::Cmd;
+use kvproto::errorpb;
+use kvproto::raft_cmdpb::{AdminCmdType, AdminRequest, AdminResponse, CmdType, Request};
+use raftstore::coprocessor::{Cmd, CmdBatch};
+use raftstore::errors::Error as RaftStoreError;
+use raftstore::store::fsm::ObserveID;
 use txn_types::{Key, Lock, LockType, TimeStamp, Value, Write, WriteRef, WriteType};
 
 pub enum ChangeRow {
@@ -18,18 +21,59 @@ pub enum ChangeRow {
     },
 }
 
-pub struct ChangeLog {
-    pub index: u64,
-    pub rows: Vec<ChangeRow>,
+pub enum ChangeLog {
+    Error(errorpb::Error),
+    Rows {
+        index: u64,
+        // (index, change rows)
+        rows: Vec<ChangeRow>,
+    },
+    None,
 }
 
 impl ChangeLog {
-    pub fn encode_change_log(cmd: Cmd) -> ChangeLog {
-        let Cmd { index, request, .. } = cmd;
-        ChangeLog {
-            index,
-            rows: Self::encode_rows(request.requests.into()),
-        }
+    pub fn encode_change_log(region_id: u64, batch: CmdBatch) -> Vec<ChangeLog> {
+        batch
+            .into_iter(region_id)
+            .map(|cmd| {
+                let Cmd {
+                    index,
+                    mut request,
+                    mut response,
+                } = cmd;
+                if !response.get_header().has_error() {
+                    if !request.has_admin_request() {
+                        let rows = Self::encode_rows(request.requests.into());
+                        ChangeLog::Rows { index, rows }
+                    } else {
+                        let mut response = response.take_admin_response();
+                        let error = match request.take_admin_request().get_cmd_type() {
+                            AdminCmdType::Split => Some(RaftStoreError::EpochNotMatch(
+                                "split".to_owned(),
+                                vec![
+                                    response.mut_split().take_left(),
+                                    response.mut_split().take_right(),
+                                ],
+                            )),
+                            AdminCmdType::BatchSplit => Some(RaftStoreError::EpochNotMatch(
+                                "batchsplit".to_owned(),
+                                response.mut_splits().take_regions().into(),
+                            )),
+                            AdminCmdType::PrepareMerge
+                            | AdminCmdType::CommitMerge
+                            | AdminCmdType::RollbackMerge => {
+                                Some(RaftStoreError::EpochNotMatch("merge".to_owned(), vec![]))
+                            }
+                            _ => None,
+                        };
+                        error.map_or(ChangeLog::None, |e| ChangeLog::Error(e.into()))
+                    }
+                } else {
+                    let err_header = response.mut_header().take_error();
+                    ChangeLog::Error(err_header.into())
+                }
+            })
+            .collect()
     }
 
     fn encode_rows(requests: Vec<Request>) -> Vec<ChangeRow> {

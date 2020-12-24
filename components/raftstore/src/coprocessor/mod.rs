@@ -228,12 +228,6 @@ impl CmdBatch {
         }
         cmd_bytes
     }
-
-    pub fn filter_admin(&mut self) {
-        self.cmds.retain(|cmd| {
-            !cmd.response.get_header().has_error() && !cmd.request.has_admin_request()
-        });
-    }
 }
 
 pub trait CmdObserver<E>: Coprocessor {

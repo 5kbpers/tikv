@@ -13,7 +13,7 @@ mod delegate;
 mod endpoint;
 mod errors;
 mod metrics;
-mod observer;
+mod reader;
 mod service;
 
 pub use endpoint::{CdcTxnExtraScheduler, Endpoint, Task};

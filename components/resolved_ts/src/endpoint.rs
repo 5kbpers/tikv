@@ -24,6 +24,7 @@ use crate::errors::Error;
 use crate::observer::ChangeDataObserver;
 use crate::resolver::Resolver;
 use crate::scanner::{ScanEntry, ScanMode, ScanTask, ScannerPool};
+use crate::sinker::{CmdSinker, SinkCmd};
 
 enum ResolverStatus {
     Pending {
@@ -68,43 +69,35 @@ impl ObserveRegion {
         }
     }
 
-    fn track_change_log(&mut self, change_logs: &[ChangeLog]) {
+    fn track_change_row(&mut self, rows: &[ChangeRow]) {
         match self.resolver_status {
             ResolverStatus::Pending { ref mut locks, .. } => {
-                for log in change_logs {
-                    log.rows.iter().for_each(|row| match row {
-                        ChangeRow::Prewrite { key, lock, .. } => locks.push(PendingLock::Track {
-                            key: key.clone(),
-                            start_ts: lock.ts,
-                        }),
-                        ChangeRow::Commit {
-                            key,
-                            commit_ts,
-                            write,
-                            ..
-                        } => locks.push(PendingLock::Untrack {
-                            key: key.clone(),
-                            start_ts: write.start_ts,
-                            commit_ts: *commit_ts,
-                        }),
-                    })
-                }
+                rows.iter().for_each(|row| match row {
+                    ChangeRow::Prewrite { key, lock, .. } => locks.push(PendingLock::Track {
+                        key: key.clone(),
+                        start_ts: lock.ts,
+                    }),
+                    ChangeRow::Commit {
+                        key,
+                        commit_ts,
+                        write,
+                        ..
+                    } => locks.push(PendingLock::Untrack {
+                        key: key.clone(),
+                        start_ts: write.start_ts,
+                        commit_ts: *commit_ts,
+                    }),
+                })
             }
-            ResolverStatus::Ready => {
-                for log in change_logs {
-                    log.rows.iter().for_each(|row| match row {
-                        ChangeRow::Prewrite { key, lock, .. } => {
-                            self.resolver.track_lock(lock.ts, key)
-                        }
-                        ChangeRow::Commit {
-                            key,
-                            commit_ts,
-                            write,
-                            ..
-                        } => self.resolver.untrack_lock(write.start_ts, *commit_ts, key),
-                    })
-                }
-            }
+            ResolverStatus::Ready => rows.iter().for_each(|row| match row {
+                ChangeRow::Prewrite { key, lock, .. } => self.resolver.track_lock(lock.ts, key),
+                ChangeRow::Commit {
+                    key,
+                    commit_ts,
+                    write,
+                    ..
+                } => self.resolver.untrack_lock(write.start_ts, *commit_ts, key),
+            }),
         }
     }
 
@@ -144,14 +137,6 @@ impl ObserveRegion {
             }
         }
     }
-}
-
-pub trait CmdSinker<S: Snapshot>: Send {
-    fn sink_cmd(
-        &mut self,
-        change_logs: Vec<(ObserveID, Vec<ChangeLog>)>,
-        snapshot: RegionSnapshot<S>,
-    );
 }
 
 pub struct Endpoint<T, E: KvEngine, C> {
@@ -238,50 +223,60 @@ where
         self.scanner_pool.spawn_task(scan_task);
     }
 
-    fn deregister_region(&mut self, region: &Region) {
-        if let Some(observe_region) = self.regions.remove(&region.id) {
-            let ObserveRegion {
-                meta: region,
-                observe_id,
-                resolver_status,
-                ..
-            } = observe_region;
-            let region_id = region.id;
-            if let Err(e) = self.raft_router.significant_send(
-                region_id,
-                SignificantMsg::CaptureChange {
-                    cmd: ChangeCmd {
-                        region_id,
-                        change_observe: ChangeObserve {
-                            id: observe_id,
-                            range: ObserveRange::None,
-                        },
+    fn deregister_region(&mut self, observe_region: ObserveRegion) {
+        let ObserveRegion {
+            meta: region,
+            observe_id,
+            resolver_status,
+            ..
+        } = observe_region;
+        let region_id = region.id;
+        if let Err(e) = self.raft_router.significant_send(
+            region_id,
+            SignificantMsg::CaptureChange {
+                cmd: ChangeCmd {
+                    region_id,
+                    change_observe: ChangeObserve {
+                        id: observe_id,
+                        range: ObserveRange::None,
                     },
-                    region_epoch: region.get_region_epoch().clone(),
-                    callback: Callback::None,
                 },
-            ) {
-                info!("send msg to deregister region failed"; "region_id" => region_id, "err" => ?e);
-            }
-            if let ResolverStatus::Pending { cancelled, .. } = resolver_status {
-                cancelled.store(true, Ordering::Release);
-            }
+                region_epoch: region.get_region_epoch().clone(),
+                callback: Callback::None,
+            },
+        ) {
+            info!("send msg to deregister region failed"; "region_id" => region_id, "err" => ?e);
+        }
+        if let ResolverStatus::Pending { cancelled, .. } = resolver_status {
+            cancelled.store(true, Ordering::Release);
         }
     }
 
     fn region_destroyed(&mut self, region: &Region) {
-        self.deregister_region(&region);
+        if let Some(observe_region) = self.regions.remove(&region.id) {
+            debug!("region destroyed"; "region_id" => region.id);
+            self.deregister_region(observe_region);
+        }
     }
 
     fn region_updated(&mut self, region: Region) {
-        self.deregister_region(&region);
-        self.register_region(region);
+        if let Some(observe_region) = self.regions.remove(&region.id) {
+            debug!("region updated"; "region_id" => region.id);
+            self.deregister_region(observe_region);
+            self.register_region(region);
+        } else {
+            debug!("update region failed, region has been deregisgered"; "region_id" => region.id);
+        }
     }
 
     fn region_role_changed(&mut self, region: Region, role: StateRole) {
         match role {
             StateRole::Leader => self.register_region(region),
-            _ => self.deregister_region(&region),
+            _ => {
+                if let Some(observe_region) = self.regions.remove(&region.id) {
+                    self.deregister_region(observe_region)
+                }
+            }
         }
     }
 
@@ -313,22 +308,30 @@ where
         cmd_batch: Vec<CmdBatch>,
         snapshot: RegionSnapshot<E::Snapshot>,
     ) {
-        let logs = cmd_batch
+        let sink_cmds = cmd_batch
             .into_iter()
-            .map(|mut batch| {
-                batch.filter_admin();
+            .map(|batch| {
                 if !batch.is_empty() {
                     let observe_region = self
                         .regions
                         .get_mut(&batch.region_id)
                         .expect("cannot find region to handle change log");
                     if observe_region.observe_id == batch.observe_id {
-                        let change_logs: Vec<_> = batch
-                            .into_iter(observe_region.meta.id)
-                            .map(|cmd| ChangeLog::encode_change_log(cmd))
-                            .collect();
-                        observe_region.track_change_log(&change_logs);
-                        return Some((observe_region.observe_id, change_logs));
+                        let region_id = observe_region.meta.id;
+                        let change_logs: Vec<_> = ChangeLog::encode_change_log(region_id, batch);
+                        for log in &change_logs {
+                            match log {
+                                ChangeLog::Rows { rows, .. } => {
+                                    observe_region.track_change_row(rows)
+                                }
+                                _ => (),
+                            }
+                        }
+                        return Some(SinkCmd::ChangeLog {
+                            logs: change_logs,
+                            region_id,
+                            observe_id: observe_region.observe_id,
+                        });
                     } else {
                         debug!("resolved ts CmdBatch discarded";
                             "region_id" => batch.region_id,
@@ -342,7 +345,7 @@ where
             .filter_map(|v| v)
             .collect();
         if let Some(sinker) = self.sinker.as_mut() {
-            sinker.sink_cmd(logs, snapshot);
+            sinker.sink_cmd(sink_cmds, snapshot);
         }
     }
 
@@ -396,6 +399,7 @@ pub enum Task<S: Snapshot> {
         observe_id: ObserveID,
         entries: Vec<ScanEntry>,
     },
+    FetchResolvedTs {},
 }
 
 impl<S: Snapshot> fmt::Debug for Task<S> {
@@ -447,6 +451,7 @@ impl<S: Snapshot> fmt::Debug for Task<S> {
                 .field("observe_id", &observe_id)
                 .finish(),
             Task::RegisterAdvanceEvent => de.field("name", &"register_advance_event").finish(),
+            $0Task::FetchResolvedTs {  } => {}
         }
     }
 }
