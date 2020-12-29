@@ -10,6 +10,7 @@ use collections::HashMap;
 use concurrency_manager::ConcurrencyManager;
 use crossbeam::atomic::AtomicCell;
 use engine_rocks::{RocksEngine, RocksSnapshot};
+use engine_traits::{KvEngine, Snapshot};
 use futures::compat::Future01CompatExt;
 use grpcio::{ChannelBuilder, Environment};
 #[cfg(feature = "prost-codec")]
@@ -17,44 +18,43 @@ use kvproto::cdcpb::event::Event as Event_oneof_event;
 use kvproto::cdcpb::*;
 use kvproto::kvrpcpb::{CheckLeaderRequest, ExtraOp as TxnExtraOp, LeaderInfo};
 use kvproto::metapb::{PeerRole, Region};
+use kvproto::raft_cmdpb::RaftCmdResponse;
 use kvproto::tikvpb::TikvClient;
 use pd_client::PdClient;
 use raftstore::coprocessor::CmdBatch;
 use raftstore::router::RaftStoreRouter;
-use raftstore::store::fsm::{ChangeCmd, ObserveID, StoreMeta};
+use raftstore::store::fsm::{ChangeCmd, ObserveId, StoreMeta};
 use raftstore::store::msg::{Callback, ReadResponse, SignificantMsg};
-use resolved_ts::Resolver;
+use raftstore::store::RegionSnapshot;
+use resolved_ts::{ChangeLog, ScanEntry, ScanMode, ScanTask, ScannerPool, SinkCmd};
 use security::SecurityManager;
 use tikv::config::CdcConfig;
-use tikv::storage::kv::Snapshot;
 use tikv::storage::mvcc::{DeltaScanner, ScannerBuilder};
 use tikv::storage::txn::TxnEntry;
 use tikv::storage::txn::TxnEntryScanner;
 use tikv::storage::Statistics;
 use tikv_util::lru::LruCache;
 use tikv_util::time::Instant;
-use tikv_util::timer::SteadyTimer;
 use tikv_util::worker::{Runnable, RunnableWithTimer, ScheduleError, Scheduler};
-use tokio::runtime::{Builder, Runtime};
 use txn_types::{
     Key, Lock, LockType, MutationType, OldValue, TimeStamp, TxnExtra, TxnExtraScheduler,
 };
 
-use crate::delegate::{Delegate, Downstream, DownstreamID, DownstreamState};
+use crate::delegate::{Delegate, Downstream, DownstreamId, DownstreamState};
 use crate::metrics::*;
 use crate::service::{CdcEvent, Conn, ConnID, FeatureGate};
-use crate::{CdcObserver, Error, Result};
+use crate::{Error, Result};
 
 pub enum Deregister {
     Downstream {
         region_id: u64,
-        downstream_id: DownstreamID,
+        downstream_id: DownstreamId,
         conn_id: ConnID,
         err: Option<Error>,
     },
     Region {
         region_id: u64,
-        observe_id: ObserveID,
+        observe_id: ObserveId,
         err: Error,
     },
     Conn(ConnID),
@@ -101,8 +101,6 @@ impl fmt::Debug for Deregister {
 }
 
 type InitCallback = Box<dyn FnOnce() + Send>;
-pub(crate) type OldValueCallback =
-    Box<dyn FnMut(Key, &mut OldValueCache, &mut Statistics) -> Option<Vec<u8>> + Send>;
 
 pub struct OldValueCache {
     pub cache: LruCache<Key, (Option<OldValue>, MutationType)>,
@@ -120,58 +118,52 @@ impl OldValueCache {
     }
 }
 
-pub enum Task {
-    Register {
+pub enum Task<S: Snapshot> {
+    RegisterDownstream {
         request: ChangeDataRequest,
         downstream: Downstream,
         conn_id: ConnID,
         version: semver::Version,
     },
-    Deregister(Deregister),
-    OpenConn {
+    RegisterConn {
         conn: Conn,
     },
-    MultiBatch {
-        multi: Vec<CmdBatch>,
-        old_value_cb: OldValueCallback,
+    Deregister(Deregister),
+    ChangeLog {
+        cmds: Vec<SinkCmd>,
+        snapshot: RegionSnapshot<S>,
     },
-    MinTS {
+    ResolvedTs {
         regions: Vec<u64>,
-        min_ts: TimeStamp,
-    },
-    ResolverReady {
-        observe_id: ObserveID,
-        region: Region,
-        resolver: Resolver,
+        ts: TimeStamp,
     },
     IncrementalScan {
         region_id: u64,
-        downstream_id: DownstreamID,
-        entries: Vec<Option<TxnEntry>>,
+        downstream_id: DownstreamId,
+        entry: ScanEntry,
     },
-    RegisterMinTsEvent,
     // The result of ChangeCmd should be returned from CDC Endpoint to ensure
     // the downstream switches to Normal after the previous commands was sunk.
     InitDownstream {
-        downstream_id: DownstreamID,
-        downstream_state: Arc<AtomicCell<DownstreamState>>,
-        cb: InitCallback,
+        region_id: u64,
+        downstream_id: DownstreamId,
+        response: RaftCmdResponse,
     },
     TxnExtra(TxnExtra),
     Validate(u64, Box<dyn FnOnce(Option<&Delegate>) + Send>),
 }
 
-impl fmt::Display for Task {
+impl<S: Snapshot> fmt::Display for Task<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self)
     }
 }
 
-impl fmt::Debug for Task {
+impl<S: Snapshot> fmt::Debug for Task<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut de = f.debug_struct("CdcTask");
         match self {
-            Task::Register {
+            Task::RegisterDownstream {
                 ref request,
                 ref downstream,
                 ref conn_id,
@@ -185,29 +177,13 @@ impl fmt::Debug for Task {
                 .field("conn_id", conn_id)
                 .field("version", version)
                 .finish(),
-            Task::Deregister(deregister) => de
-                .field("type", &"deregister")
-                .field("deregister", deregister)
-                .finish(),
-            Task::OpenConn { ref conn } => de
+            Task::RegisterConn { ref conn } => de
                 .field("type", &"open_conn")
                 .field("conn_id", &conn.get_id())
                 .finish(),
-            Task::MultiBatch { multi, .. } => de
-                .field("type", &"multibatch")
-                .field("multibatch", &multi.len())
-                .finish(),
-            Task::MinTS { ref min_ts, .. } => {
-                de.field("type", &"mit_ts").field("min_ts", min_ts).finish()
-            }
-            Task::ResolverReady {
-                ref observe_id,
-                ref region,
-                ..
-            } => de
-                .field("type", &"resolver_ready")
-                .field("observe_id", &observe_id)
-                .field("region_id", &region.get_id())
+            Task::Deregister(deregister) => de
+                .field("type", &"deregister")
+                .field("deregister", deregister)
                 .finish(),
             Task::IncrementalScan {
                 ref region_id,
@@ -219,7 +195,6 @@ impl fmt::Debug for Task {
                 .field("downstream", &downstream_id)
                 .field("scan_entries", &entries.len())
                 .finish(),
-            Task::RegisterMinTsEvent => de.field("type", &"register_min_ts").finish(),
             Task::InitDownstream {
                 ref downstream_id, ..
             } => de
@@ -227,6 +202,8 @@ impl fmt::Debug for Task {
                 .field("downstream", &downstream_id)
                 .finish(),
             Task::TxnExtra(_) => de.field("type", &"txn_extra").finish(),
+            Task::ChangeLog { cmds, snapshot } => de.field("type", &"change_log").finish(),
+            Task::ResolvedTs { regions, ts } => de.field("type", &"resolevd_ts").finish(),
             Task::Validate(region_id, _) => de.field("region_id", &region_id).finish(),
         }
     }
@@ -234,92 +211,40 @@ impl fmt::Debug for Task {
 
 const METRICS_FLUSH_INTERVAL: u64 = 10_000; // 10s
 
-pub struct Endpoint<T> {
+pub struct Endpoint<T, E: KvEngine> {
     capture_regions: HashMap<u64, Delegate>,
     connections: HashMap<ConnID, Conn>,
-    scheduler: Scheduler<Task>,
+    scheduler: Scheduler<Task<E::Snapshot>>,
     raft_router: T,
-    observer: CdcObserver,
 
-    pd_client: Arc<dyn PdClient>,
-    timer: SteadyTimer,
-    min_ts_interval: Duration,
-    scan_batch_size: usize,
-    tso_worker: Runtime,
     store_meta: Arc<Mutex<StoreMeta>>,
-    /// The concurrency manager for transactions. It's needed for CDC to check locks when
-    /// calculating resolved_ts.
-    concurrency_manager: ConcurrencyManager,
-
-    workers: Runtime,
+    scanner_pool: ScannerPool<T, E>,
 
     min_resolved_ts: TimeStamp,
     min_ts_region_id: u64,
     old_value_cache: OldValueCache,
-    hibernate_regions_compatible: bool,
-
-    // store_id -> client
-    tikv_clients: Arc<Mutex<HashMap<u64, TikvClient>>>,
-    env: Arc<Environment>,
-    security_mgr: Arc<SecurityManager>,
 }
 
-impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
+impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
     pub fn new(
         cfg: &CdcConfig,
-        pd_client: Arc<dyn PdClient>,
-        scheduler: Scheduler<Task>,
+        scheduler: Scheduler<Task<E::Snapshot>>,
         raft_router: T,
-        observer: CdcObserver,
         store_meta: Arc<Mutex<StoreMeta>>,
-        concurrency_manager: ConcurrencyManager,
-        env: Arc<Environment>,
-        security_mgr: Arc<SecurityManager>,
-    ) -> Endpoint<T> {
-        let workers = Builder::new()
-            .threaded_scheduler()
-            .thread_name("cdcwkr")
-            .core_threads(4)
-            .build()
-            .unwrap();
-        let tso_worker = Builder::new()
-            .threaded_scheduler()
-            .thread_name("tso")
-            .core_threads(1)
-            .build()
-            .unwrap();
+        scanner_pool: ScannerPool<T, E>,
+    ) -> Endpoint<T, E> {
         let ep = Endpoint {
-            env,
-            security_mgr,
             capture_regions: HashMap::default(),
             connections: HashMap::default(),
             scheduler,
-            pd_client,
-            tso_worker,
-            timer: SteadyTimer::default(),
-            workers,
             raft_router,
-            observer,
             store_meta,
-            concurrency_manager,
-            scan_batch_size: 1024,
-            min_ts_interval: cfg.min_ts_interval.0,
+            scanner_pool,
             min_resolved_ts: TimeStamp::max(),
             min_ts_region_id: 0,
             old_value_cache: OldValueCache::new(cfg.old_value_cache_size),
-            hibernate_regions_compatible: cfg.hibernate_regions_compatible,
-            tikv_clients: Arc::new(Mutex::new(HashMap::default())),
         };
-        ep.register_min_ts_event();
         ep
-    }
-
-    pub fn set_min_ts_interval(&mut self, dur: Duration) {
-        self.min_ts_interval = dur;
-    }
-
-    pub fn set_scan_batch_size(&mut self, scan_batch_size: usize) {
-        self.scan_batch_size = scan_batch_size;
     }
 
     fn on_deregister(&mut self, deregister: Deregister) {
@@ -345,20 +270,12 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
                     }
                 }
                 if is_last {
-                    let delegate = self.capture_regions.remove(&region_id).unwrap();
+                    self.capture_regions.remove(&region_id).unwrap();
                     if let Some(reader) = self.store_meta.lock().unwrap().readers.get(&region_id) {
                         reader
                             .txn_extra_op
                             .compare_and_swap(TxnExtraOp::ReadOldValue, TxnExtraOp::Noop);
                     }
-                    // Do not continue to observe the events of the region.
-                    let oid = self.observer.unsubscribe_region(region_id, delegate.id);
-                    assert!(
-                        oid.is_some(),
-                        "unsubscribe region {} failed, ObserveID {:?}",
-                        region_id,
-                        delegate.id
-                    );
                 }
             }
             Deregister::Region {
@@ -384,15 +301,6 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
                         .iter_mut()
                         .for_each(|(_, conn)| conn.unsubscribe(region_id));
                 }
-                // Do not continue to observe the events of the region.
-                let oid = self.observer.unsubscribe_region(region_id, observe_id);
-                assert_eq!(
-                    need_remove,
-                    oid.is_some(),
-                    "unsubscribe region {} failed, ObserveID {:?}",
-                    region_id,
-                    observe_id
-                );
             }
             Deregister::Conn(conn_id) => {
                 // The connection is closed, deregister all downstreams of the connection.
@@ -402,16 +310,7 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
                         .for_each(|(region_id, downstream_id)| {
                             if let Some(delegate) = self.capture_regions.get_mut(&region_id) {
                                 if delegate.unsubscribe(downstream_id, None) {
-                                    let delegate = self.capture_regions.remove(&region_id).unwrap();
-                                    // Do not continue to observe the events of the region.
-                                    let oid =
-                                        self.observer.unsubscribe_region(region_id, delegate.id);
-                                    assert!(
-                                        oid.is_some(),
-                                        "unsubscribe region {} failed, ObserveID {:?}",
-                                        region_id,
-                                        delegate.id
-                                    );
+                                    self.capture_regions.remove(&region_id).unwrap();
                                 }
                             }
                         });
@@ -467,40 +366,10 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
             d
         });
 
-        let downstream_state = downstream.get_state();
-        let checkpoint_ts = request.checkpoint_ts;
-        let sched = self.scheduler.clone();
-        let batch_size = self.scan_batch_size;
-
-        if !delegate.subscribe(downstream) {
-            conn.unsubscribe(request.get_region_id());
-            if is_new_delegate {
-                self.capture_regions.remove(&request.get_region_id());
-            }
-            return;
-        }
-        let change_cmd = if is_new_delegate {
-            // The region has never been registered.
-            // Subscribe the change events of the region.
-            let old_id = self.observer.subscribe_region(region_id, delegate.id);
-            assert!(
-                old_id.is_none(),
-                "region {} must not be observed twice, old ObserveID {:?}, new ObserveID {:?}",
-                region_id,
-                old_id,
-                delegate.id
-            );
-
-            ChangeCmd::RegisterObserver {
-                observe_id: delegate.id,
-                region_id,
-                enabled: delegate.enabled(),
-            }
-        } else {
-            ChangeCmd::Snapshot {
-                observe_id: delegate.id,
-                region_id,
-            }
+        delegate.subscribe(downstream);
+        let change_cmd = ChangeCmd {
+            region_id,
+            change_observe: None,
         };
         let txn_extra_op = request.get_extra_op();
         if txn_extra_op != TxnExtraOp::Noop {
@@ -509,77 +378,78 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
                 reader.txn_extra_op.store(txn_extra_op);
             }
         }
-        let init = Initializer {
-            sched,
-            region_id,
-            conn_id,
-            downstream_id,
-            batch_size,
-            downstream_state: downstream_state.clone(),
-            txn_extra_op: delegate.txn_extra_op,
-            observe_id: delegate.id,
-            checkpoint_ts: checkpoint_ts.into(),
-            build_resolver: is_new_delegate,
-        };
 
-        let (cb, fut) = tikv_util::future::paired_future_callback();
-        let scheduler = self.scheduler.clone();
-        let deregister_downstream = move |err| {
-            warn!("cdc send capture change cmd failed"; "region_id" => region_id, "error" => ?err);
-            let deregister = Deregister::Downstream {
-                region_id,
-                downstream_id,
-                conn_id,
-                err: Some(err),
-            };
-            if let Err(e) = scheduler.schedule(Task::Deregister(deregister)) {
-                error!("schedule cdc task failed"; "error" => ?e);
-            }
+        let scan_mode = match delegate.txn_extra_op {
+            TxnExtraOp::ReadOldValue => ScanMode::AllWithOldValue,
+            _ => ScanMode::All,
         };
+        let mut region = Region::default();
+        region.set_id(region_id);
+        region.set_region_epoch(request.take_region_epoch());
+        let downstream_state = downstream.get_state();
+        let downstream_state1 = downstream.get_state();
+        let checkpoint_ts = request.checkpoint_ts;
         let scheduler = self.scheduler.clone();
-        if let Err(e) = self.raft_router.significant_send(
-            region_id,
-            SignificantMsg::CaptureChange {
-                cmd: change_cmd,
-                region_epoch: request.take_region_epoch(),
-                callback: Callback::Read(Box::new(move |resp| {
-                    if let Err(e) = scheduler.schedule(Task::InitDownstream {
-                        downstream_id,
-                        downstream_state,
-                        cb: Box::new(move || {
-                            cb(resp);
-                        }),
-                    }) {
-                        error!("schedule cdc task failed"; "error" => ?e);
-                    }
-                })),
-            },
-        ) {
-            deregister_downstream(Error::Request(e.into()));
-            return;
-        }
-        self.workers.spawn(async move {
-            match fut.await {
-                Ok(resp) => init.on_change_cmd(resp),
-                Err(e) => deregister_downstream(Error::Other(box_err!(e))),
-            }
-        });
+        let scheduler_clone = self.scheduler.clone();
+
+        let task = ScanTask {
+            id: downstream_id.into_inner(),
+            tag: format!(""),
+            mode: scan_mode,
+            region,
+            checkpoint_ts: checkpoint_ts.into(),
+            cancelled: Box::new(move || downstream_state.load() == DownstreamState::Stopped),
+            send_entries: Box::new(move |entry| {
+                scheduler.schedule(Task::IncrementalScan {
+                    region_id,
+                    downstream_id,
+                    entry,
+                });
+            }),
+            before_start: Some(Box::new(move |response| {
+                scheduler.schedule(Task::InitDownstream {
+                    region_id,
+                    downstream_id,
+                    response: response.clone(),
+                });
+            })),
+            on_error: Some(Box::new(move |region, error| {
+                scheduler.schedule(Task::Deregister(Deregister::Downstream {
+                    region_id: region.id,
+                    downstream_id,
+                    conn_id,
+                    err: Some(Error::Request(error.extract_error_header())),
+                }));
+            })),
+        };
+        self.scanner_pool.spawn_task(task);
     }
 
-    pub fn on_multi_batch(&mut self, multi: Vec<CmdBatch>, old_value_cb: OldValueCallback) {
+    pub fn init_downstream(
+        &mut self,
+        region_id: u64,
+        downstream_id: DownstreamId,
+        response: RaftCmdResponse,
+    ) {
+        if let Some(delegate) = self.capture_regions.get_mut(&region_id) {
+            assert_eq!(response.responses.len(), 1);
+            let index = response.responses[0].get_read_index().read_index;
+            delegate.init_downstream(downstream_id, index);
+            debug!("downstream was initialized"; "downstream_id" => ?downstream_id);
+        }
+    }
+
+    pub fn on_change_log(&mut self, cmds: Vec<SinkCmd>, snapshot: RegionSnapshot<E::Snapshot>) {
         fail_point!("cdc_before_handle_multi_batch", |_| {});
-        let old_value_cb = Rc::new(RefCell::new(old_value_cb));
-        for batch in multi {
-            let region_id = batch.region_id;
+        for cmd in cmds {
+            let region_id = cmd.region_id;
             let mut deregister = None;
             if let Some(delegate) = self.capture_regions.get_mut(&region_id) {
                 if delegate.has_failed() {
                     // Skip the batch if the delegate has failed.
                     continue;
                 }
-                if let Err(e) =
-                    delegate.on_batch(batch, old_value_cb.clone(), &mut self.old_value_cache)
-                {
+                if let Err(e) = delegate.on_sink_cmd(cmd, snapshot, &mut self.old_value_cache) {
                     assert!(delegate.has_failed());
                     // Delegate has error, deregister the corresponding region.
                     deregister = Some(Deregister::Region {
@@ -598,54 +468,14 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
     pub fn on_incremental_scan(
         &mut self,
         region_id: u64,
-        downstream_id: DownstreamID,
-        entries: Vec<Option<TxnEntry>>,
+        downstream_id: DownstreamId,
+        entry: ScanEntry,
     ) {
         if let Some(delegate) = self.capture_regions.get_mut(&region_id) {
-            delegate.on_scan(downstream_id, entries);
+            delegate.on_scan(downstream_id, entry);
         } else {
             warn!("region not found on incremental scan"; "region_id" => region_id);
         }
-    }
-
-    fn on_region_ready(&mut self, observe_id: ObserveID, resolver: Resolver, region: Region) {
-        let region_id = region.get_id();
-        if let Some(delegate) = self.capture_regions.get_mut(&region_id) {
-            if delegate.id == observe_id {
-                for downstream in delegate.on_region_ready(resolver, region) {
-                    let conn_id = downstream.get_conn_id();
-                    if !delegate.subscribe(downstream) {
-                        let conn = self.connections.get_mut(&conn_id).unwrap();
-                        conn.unsubscribe(region_id);
-                    }
-                }
-            } else {
-                debug!("stale region ready";
-                    "region_id" => region.get_id(),
-                    "observe_id" => ?observe_id,
-                    "current_id" => ?delegate.id);
-            }
-        } else {
-            debug!("region not found on region ready (finish building resolver)";
-                "region_id" => region.get_id());
-        }
-    }
-
-    fn on_min_ts(&mut self, regions: Vec<u64>, min_ts: TimeStamp) {
-        let mut resolved_regions = Vec::with_capacity(regions.len());
-        self.min_resolved_ts = TimeStamp::max();
-        for region_id in regions {
-            if let Some(delegate) = self.capture_regions.get_mut(&region_id) {
-                if let Some(resolved_ts) = delegate.on_min_ts(min_ts) {
-                    if resolved_ts < self.min_resolved_ts {
-                        self.min_resolved_ts = resolved_ts;
-                        self.min_ts_region_id = region_id;
-                    }
-                    resolved_regions.push(region_id);
-                }
-            }
-        }
-        self.broadcast_resolved_ts(resolved_regions);
     }
 
     fn broadcast_resolved_ts(&self, regions: Vec<u64>) {
@@ -708,272 +538,7 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
         downstream.sink_event(event);
     }
 
-    fn register_min_ts_event(&self) {
-        let timeout = self.timer.delay(self.min_ts_interval);
-        let pd_client = self.pd_client.clone();
-        let scheduler = self.scheduler.clone();
-        let raft_router = self.raft_router.clone();
-        let regions: Vec<(u64, ObserveID)> = self
-            .capture_regions
-            .iter()
-            .map(|(region_id, delegate)| (*region_id, delegate.id))
-            .collect();
-        let cm: ConcurrencyManager = self.concurrency_manager.clone();
-        let env = self.env.clone();
-        let security_mgr = self.security_mgr.clone();
-        let store_meta = self.store_meta.clone();
-        let tikv_clients = self.tikv_clients.clone();
-        let hibernate_regions_compatible = self.hibernate_regions_compatible;
-
-        let fut = async move {
-            let _ = timeout.compat().await;
-            // Ignore get tso errors since we will retry every `min_ts_interval`.
-            let mut min_ts = pd_client.get_tso().await.unwrap_or_default();
-
-            // Sync with concurrency manager so that it can work correctly when optimizations
-            // like async commit is enabled.
-            // Note: This step must be done before scheduling `Task::MinTS` task, and the
-            // resolver must be checked in or after `Task::MinTS`' execution.
-            cm.update_max_ts(min_ts);
-            if let Some(min_mem_lock_ts) = cm.global_min_lock_ts() {
-                if min_mem_lock_ts < min_ts {
-                    min_ts = min_mem_lock_ts;
-                }
-            }
-
-            match scheduler.schedule(Task::RegisterMinTsEvent) {
-                Ok(_) | Err(ScheduleError::Stopped(_)) => (),
-                // Must schedule `RegisterMinTsEvent` event otherwise resolved ts can not
-                // advance normally.
-                Err(err) => panic!("failed to regiester min ts event, error: {:?}", err),
-            }
-
-            let regions = if hibernate_regions_compatible {
-                Self::region_resolved_ts_store(
-                    regions,
-                    store_meta,
-                    pd_client,
-                    security_mgr,
-                    env,
-                    tikv_clients,
-                    min_ts,
-                )
-                .await
-            } else {
-                Self::region_resolved_ts_raft(regions, &scheduler, raft_router, min_ts).await
-            };
-
-            if !regions.is_empty() {
-                match scheduler.schedule(Task::MinTS { regions, min_ts }) {
-                    Ok(_) | Err(ScheduleError::Stopped(_)) => (),
-                    // Must schedule `RegisterMinTsEvent` event otherwise resolved ts can not
-                    // advance normally.
-                    Err(err) => panic!("failed to schedule min ts event, error: {:?}", err),
-                }
-            }
-        };
-        self.tso_worker.spawn(fut);
-    }
-
-    async fn region_resolved_ts_raft(
-        regions: Vec<(u64, ObserveID)>,
-        scheduler: &Scheduler<Task>,
-        raft_router: T,
-        min_ts: TimeStamp,
-    ) -> Vec<u64> {
-        // TODO: send a message to raftstore would consume too much cpu time,
-        // try to handle it outside raftstore.
-        let regions: Vec<_> = regions
-            .iter()
-            .copied()
-            .map(|(region_id, observe_id)| {
-                let scheduler_clone = scheduler.clone();
-                let raft_router_clone = raft_router.clone();
-                async move {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    if let Err(e) = raft_router_clone.significant_send(
-                        region_id,
-                        SignificantMsg::LeaderCallback(Callback::Read(Box::new(move |resp| {
-                            let resp = if resp.response.get_header().has_error() {
-                                None
-                            } else {
-                                Some(region_id)
-                            };
-                            if tx.send(resp).is_err() {
-                                error!("cdc send tso response failed"; "region_id" => region_id);
-                            }
-                        }))),
-                    ) {
-                        warn!("cdc send LeaderCallback failed"; "err" => ?e, "min_ts" => min_ts);
-                        let deregister = Deregister::Region {
-                            observe_id,
-                            region_id,
-                            err: Error::Request(e.into()),
-                        };
-                        if let Err(e) = scheduler_clone.schedule(Task::Deregister(deregister)) {
-                            error!("schedule cdc task failed"; "error" => ?e);
-                        }
-                        return None;
-                    }
-                    rx.await.unwrap_or(None)
-                }
-            })
-            .collect();
-        let resps = futures::future::join_all(regions).await;
-        resps
-            .into_iter()
-            .filter_map(|resp| resp)
-            .collect::<Vec<u64>>()
-    }
-
-    async fn region_resolved_ts_store(
-        regions: Vec<(u64, ObserveID)>,
-        store_meta: Arc<Mutex<StoreMeta>>,
-        pd_client: Arc<dyn PdClient>,
-        security_mgr: Arc<SecurityManager>,
-        env: Arc<Environment>,
-        cdc_clients: Arc<Mutex<HashMap<u64, TikvClient>>>,
-        min_ts: TimeStamp,
-    ) -> Vec<u64> {
-        let region_has_quorum = |region: &Region, stores: Vec<u64>| {
-            let mut voters = 0;
-            let mut incoming_voters = 0;
-            let mut demoting_voters = 0;
-
-            let mut resp_voters = 0;
-            let mut resp_incoming_voters = 0;
-            let mut resp_demoting_voters = 0;
-
-            region.get_peers().iter().for_each(|peer| {
-                let mut in_resp = false;
-                for store_id in &stores {
-                    if *store_id == peer.store_id {
-                        in_resp = true;
-                        break;
-                    }
-                }
-                match peer.get_role() {
-                    PeerRole::Voter => {
-                        voters += 1;
-                        if in_resp {
-                            resp_voters += 1;
-                        }
-                    }
-                    PeerRole::IncomingVoter => {
-                        incoming_voters += 1;
-                        if in_resp {
-                            resp_incoming_voters += 1;
-                        }
-                    }
-                    PeerRole::DemotingVoter => {
-                        demoting_voters += 1;
-                        if in_resp {
-                            resp_demoting_voters += 1;
-                        }
-                    }
-                    PeerRole::Learner => (),
-                }
-            });
-
-            let has_incoming_majority =
-                (resp_voters + resp_incoming_voters) >= ((voters + incoming_voters) / 2 + 1);
-            let has_demoting_majority =
-                (resp_voters + resp_demoting_voters) >= ((voters + demoting_voters) / 2 + 1);
-
-            has_incoming_majority && has_demoting_majority
-        };
-
-        // store_id -> leaders info, record the request to each stores
-        let mut store_map: HashMap<u64, Vec<LeaderInfo>> = HashMap::default();
-        // region_id -> region, cache the information of regions
-        let mut region_map: HashMap<u64, Region> = HashMap::default();
-        // region_id -> peers id, record the responses
-        let mut resp_map: HashMap<u64, Vec<u64>> = HashMap::default();
-        {
-            let meta = store_meta.lock().unwrap();
-            let store_id = match meta.store_id {
-                Some(id) => id,
-                None => return vec![],
-            };
-            for (region_id, _) in regions {
-                if let Some(region) = meta.regions.get(&region_id) {
-                    if let Some((term, leader)) = meta.leaders.get(&region_id) {
-                        if leader.store_id != meta.store_id.unwrap() {
-                            continue;
-                        }
-                        for peer in region.get_peers() {
-                            if peer.store_id == store_id && peer.id == leader.id {
-                                resp_map.entry(region_id).or_default().push(store_id);
-                                continue;
-                            }
-                            if peer.get_role() == PeerRole::Learner {
-                                continue;
-                            }
-                            let mut leader_info = LeaderInfo::default();
-                            leader_info.set_peer_id(leader.id);
-                            leader_info.set_term(*term);
-                            leader_info.set_region_id(region_id);
-                            leader_info.set_region_epoch(region.get_region_epoch().clone());
-                            store_map
-                                .entry(peer.store_id)
-                                .or_default()
-                                .push(leader_info);
-                        }
-                        region_map.insert(region_id, region.clone());
-                    }
-                }
-            }
-        }
-        let stores = store_map.into_iter().map(|(store_id, regions)| {
-            let cdc_clients = cdc_clients.clone();
-            let env = env.clone();
-            let pd_client = pd_client.clone();
-            let security_mgr = security_mgr.clone();
-            async move {
-                if cdc_clients.lock().unwrap().get(&store_id).is_none() {
-                    let store = box_try!(pd_client.get_store_async(store_id).await);
-                    let cb = ChannelBuilder::new(env.clone());
-                    let channel = security_mgr.connect(cb, &store.address);
-                    cdc_clients
-                        .lock()
-                        .unwrap()
-                        .insert(store_id, TikvClient::new(channel));
-                }
-                let client = cdc_clients.lock().unwrap().get(&store_id).unwrap().clone();
-                let mut req = CheckLeaderRequest::default();
-                req.set_regions(regions.into());
-                req.set_ts(min_ts.into_inner());
-                let res = box_try!(client.check_leader_async(&req)).await;
-                let resp = box_try!(res);
-                Result::Ok((store_id, resp))
-            }
-        });
-        let resps = futures::future::join_all(stores).await;
-        resps
-            .into_iter()
-            .filter_map(Result::ok)
-            .map(|(store_id, resp)| {
-                resp.regions
-                    .into_iter()
-                    .map(move |region_id| (store_id, region_id))
-            })
-            .flatten()
-            .for_each(|(store_id, region_id)| {
-                resp_map.entry(region_id).or_default().push(store_id);
-            });
-        resp_map
-            .into_iter()
-            .filter_map(|(region_id, stores)| {
-                if region_has_quorum(&region_map[&region_id], stores) {
-                    Some(region_id)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    fn on_open_conn(&mut self, conn: Conn) {
+    fn on_register_conn(&mut self, conn: Conn) {
         self.connections.insert(conn.get_id(), conn);
     }
 
@@ -982,222 +547,34 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
     }
 }
 
-struct Initializer {
-    sched: Scheduler<Task>,
+impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Runnable for Endpoint<T, E> {
+    type Task = Task<E::Snapshot>;
 
-    region_id: u64,
-    observe_id: ObserveID,
-    downstream_id: DownstreamID,
-    downstream_state: Arc<AtomicCell<DownstreamState>>,
-    conn_id: ConnID,
-    checkpoint_ts: TimeStamp,
-    batch_size: usize,
-    txn_extra_op: TxnExtraOp,
-
-    build_resolver: bool,
-}
-
-impl Initializer {
-    fn on_change_cmd(&self, mut resp: ReadResponse<RocksSnapshot>) {
-        if let Some(region_snapshot) = resp.snapshot {
-            assert_eq!(self.region_id, region_snapshot.get_region().get_id());
-            let region = region_snapshot.get_region().clone();
-            self.async_incremental_scan(region_snapshot, region);
-        } else {
-            assert!(
-                resp.response.get_header().has_error(),
-                "no snapshot and no error? {:?}",
-                resp.response
-            );
-            let err = resp.response.take_header().take_error();
-            let deregister = Deregister::Region {
-                region_id: self.region_id,
-                observe_id: self.observe_id,
-                err: Error::Request(err),
-            };
-            if let Err(e) = self.sched.schedule(Task::Deregister(deregister)) {
-                error!("schedule cdc task failed"; "error" => ?e);
-            }
-        }
-    }
-
-    fn async_incremental_scan<S: Snapshot + 'static>(&self, snap: S, region: Region) {
-        let downstream_id = self.downstream_id;
-        let conn_id = self.conn_id;
-        let region_id = region.get_id();
-        debug!("async incremental scan";
-            "region_id" => region_id,
-            "downstream_id" => ?downstream_id,
-            "observe_id" => ?self.observe_id);
-
-        let mut resolver = if self.build_resolver {
-            Some(Resolver::new(region_id))
-        } else {
-            None
-        };
-
-        fail_point!("cdc_incremental_scan_start");
-
-        let start = Instant::now_coarse();
-        // Time range: (checkpoint_ts, current]
-        let current = TimeStamp::max();
-        let mut scanner = ScannerBuilder::new(snap, current, false)
-            .range(None, None)
-            .build_delta_scanner(self.checkpoint_ts, self.txn_extra_op)
-            .unwrap();
-        let mut done = false;
-        while !done {
-            if self.downstream_state.load() != DownstreamState::Normal {
-                info!("async incremental scan canceled";
-                    "region_id" => region_id,
-                    "downstream_id" => ?downstream_id,
-                    "observe_id" => ?self.observe_id);
-                return;
-            }
-            let entries = match Self::scan_batch(&mut scanner, self.batch_size, resolver.as_mut()) {
-                Ok(res) => res,
-                Err(e) => {
-                    error!("cdc scan entries failed"; "error" => ?e, "region_id" => region_id);
-                    // TODO: record in metrics.
-                    let deregister = Deregister::Downstream {
-                        region_id,
-                        downstream_id,
-                        conn_id,
-                        err: Some(e),
-                    };
-                    if let Err(e) = self.sched.schedule(Task::Deregister(deregister)) {
-                        error!("schedule cdc task failed"; "error" => ?e, "region_id" => region_id);
-                    }
-                    return;
-                }
-            };
-            // If the last element is None, it means scanning is finished.
-            if let Some(None) = entries.last() {
-                done = true;
-            }
-            debug!("cdc scan entries"; "len" => entries.len(), "region_id" => region_id);
-            fail_point!("before_schedule_incremental_scan");
-            let scanned = Task::IncrementalScan {
-                region_id,
-                downstream_id,
-                entries,
-            };
-            if let Err(e) = self.sched.schedule(scanned) {
-                error!("schedule cdc task failed"; "error" => ?e, "region_id" => region_id);
-                return;
-            }
-        }
-
-        let takes = start.elapsed();
-        if let Some(resolver) = resolver {
-            self.finish_building_resolver(resolver, region, takes);
-        }
-
-        CDC_SCAN_DURATION_HISTOGRAM.observe(takes.as_secs_f64());
-    }
-
-    fn scan_batch<S: Snapshot>(
-        scanner: &mut DeltaScanner<S>,
-        batch_size: usize,
-        resolver: Option<&mut Resolver>,
-    ) -> Result<Vec<Option<TxnEntry>>> {
-        let mut entries = Vec::with_capacity(batch_size);
-        while entries.len() < entries.capacity() {
-            match scanner.next_entry()? {
-                Some(entry) => {
-                    entries.push(Some(entry));
-                }
-                None => {
-                    entries.push(None);
-                    break;
-                }
-            }
-        }
-
-        if let Some(resolver) = resolver {
-            // Track the locks.
-            for entry in &entries {
-                if let Some(TxnEntry::Prewrite { lock, .. }) = entry {
-                    let (encoded_key, value) = lock;
-                    let key = Key::from_encoded_slice(encoded_key).into_raw().unwrap();
-                    let lock = Lock::parse(value)?;
-                    match lock.lock_type {
-                        LockType::Put | LockType::Delete => resolver.track_lock(lock.ts, key),
-                        _ => (),
-                    };
-                }
-            }
-        }
-
-        Ok(entries)
-    }
-
-    fn finish_building_resolver(&self, mut resolver: Resolver, region: Region, takes: Duration) {
-        let observe_id = self.observe_id;
-        resolver.init();
-        let rts = resolver.resolve(TimeStamp::zero());
-        info!(
-            "resolver initialized and schedule resolver ready";
-            "region_id" => region.get_id(),
-            "resolved_ts" => rts,
-            "lock_count" => resolver.locks().len(),
-            "observe_id" => ?observe_id,
-            "takes" => ?takes,
-        );
-
-        fail_point!("before_schedule_resolver_ready");
-        if let Err(e) = self.sched.schedule(Task::ResolverReady {
-            observe_id,
-            resolver,
-            region,
-        }) {
-            error!("schedule task failed"; "error" => ?e);
-        }
-    }
-}
-
-impl<T: 'static + RaftStoreRouter<RocksEngine>> Runnable for Endpoint<T> {
-    type Task = Task;
-
-    fn run(&mut self, task: Task) {
+    fn run(&mut self, task: Task<E::Snapshot>) {
         debug!("run cdc task"; "task" => %task);
         match task {
-            Task::MinTS { regions, min_ts } => self.on_min_ts(regions, min_ts),
-            Task::Register {
+            Task::RegisterDownstream {
                 request,
                 downstream,
                 conn_id,
                 version,
             } => self.on_register(request, downstream, conn_id, version),
-            Task::ResolverReady {
-                observe_id,
-                resolver,
-                region,
-            } => self.on_region_ready(observe_id, resolver, region),
+            Task::RegisterConn { conn } => self.on_register_conn(conn),
             Task::Deregister(deregister) => self.on_deregister(deregister),
             Task::IncrementalScan {
                 region_id,
                 downstream_id,
-                entries,
+                entry,
             } => {
-                self.on_incremental_scan(region_id, downstream_id, entries);
+                self.on_incremental_scan(region_id, downstream_id, entry);
             }
-            Task::MultiBatch {
-                multi,
-                old_value_cb,
-            } => self.on_multi_batch(multi, old_value_cb),
-            Task::OpenConn { conn } => self.on_open_conn(conn),
-            Task::RegisterMinTsEvent => self.register_min_ts_event(),
+            Task::ChangeLog { cmds, snapshot } => self.on_change_log(cmds, snapshot),
+            Task::ResolvedTs { regions, ts } => self.on_resolved_ts(regions, ts),
             Task::InitDownstream {
+                region_id,
                 downstream_id,
-                downstream_state,
-                cb,
-            } => {
-                debug!("downstream was initialized"; "downstream_id" => ?downstream_id);
-                downstream_state
-                    .compare_and_swap(DownstreamState::Uninitialized, DownstreamState::Normal);
-                cb();
-            }
+                response,
+            } => self.init_downstream(region_id, downstream_id, response),
             Task::TxnExtra(txn_extra) => {
                 for (k, v) in txn_extra.old_values {
                     self.old_value_cache.cache.insert(k, v);
@@ -1211,7 +588,7 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Runnable for Endpoint<T> {
     }
 }
 
-impl<T: 'static + RaftStoreRouter<RocksEngine>> RunnableWithTimer for Endpoint<T> {
+impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> RunnableWithTimer for Endpoint<T, E> {
     fn on_timeout(&mut self) {
         CDC_CAPTURED_REGION_COUNT.set(self.capture_regions.len() as i64);
         if self.min_resolved_ts != TimeStamp::max() {
@@ -1240,17 +617,17 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> RunnableWithTimer for Endpoint<T
     }
 }
 
-pub struct CdcTxnExtraScheduler {
-    scheduler: Scheduler<Task>,
+pub struct CdcTxnExtraScheduler<S: Snapshot> {
+    scheduler: Scheduler<Task<S>>,
 }
 
-impl CdcTxnExtraScheduler {
-    pub fn new(scheduler: Scheduler<Task>) -> CdcTxnExtraScheduler {
+impl<S: Snapshot> CdcTxnExtraScheduler<S> {
+    pub fn new(scheduler: Scheduler<Task<S>>) -> CdcTxnExtraScheduler<S> {
         CdcTxnExtraScheduler { scheduler }
     }
 }
 
-impl TxnExtraScheduler for CdcTxnExtraScheduler {
+impl<S: Snapshot> TxnExtraScheduler for CdcTxnExtraScheduler<S> {
     fn schedule(&self, txn_extra: TxnExtra) {
         if let Err(e) = self.scheduler.schedule(Task::TxnExtra(txn_extra)) {
             error!("cdc schedule txn extra failed"; "err" => ?e);
@@ -1315,14 +692,12 @@ mod tests {
             sched: receiver_worker.scheduler(),
 
             region_id: 1,
-            observe_id: ObserveID::new(),
-            downstream_id: DownstreamID::new(),
+            observe_id: ObserveId::new(),
+            downstream_id: DownstreamId::new(),
             downstream_state,
             conn_id: ConnID::new(),
             checkpoint_ts: 1.into(),
-            batch_size: 1,
             txn_extra_op: TxnExtraOp::Noop,
-            build_resolver: true,
         };
 
         (receiver_worker, pool, initializer, rx)
@@ -1346,9 +721,7 @@ mod tests {
             pd_client,
             task_sched,
             raft_router.clone(),
-            observer,
             Arc::new(Mutex::new(StoreMeta::new(0))),
-            ConcurrencyManager::new(1.into()),
             env,
             security_mgr,
         );
@@ -1782,7 +1155,7 @@ mod tests {
         let deregister = Deregister::Region {
             region_id: 1,
             // A stale ObserveID (different from the actual one).
-            observe_id: ObserveID::new(),
+            observe_id: ObserveId::new(),
             err: Error::Request(err_header),
         };
         ep.run(Task::Deregister(deregister));

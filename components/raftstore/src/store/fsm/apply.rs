@@ -928,7 +928,6 @@ where
 
             return self.process_raft_cmd(apply_ctx, index, term, cmd);
         }
-        // TOOD(cdc): should we observe empty cmd, aka leader change?
 
         self.apply_state.set_applied_index(index);
         self.applied_index_term = term;
@@ -2804,23 +2803,42 @@ static OBSERVE_ID_ALLOC: AtomicUsize = AtomicUsize::new(0);
 
 /// A unique identifier for checking stale observed commands.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct ObserveID(usize);
+pub struct ObserveId(usize);
 
-impl ObserveID {
-    pub fn new() -> ObserveID {
-        ObserveID(OBSERVE_ID_ALLOC.fetch_add(1, Ordering::SeqCst))
+impl ObserveId {
+    pub fn new() -> ObserveId {
+        ObserveId(OBSERVE_ID_ALLOC.fetch_add(1, Ordering::SeqCst))
+    }
+
+    pub fn zero() -> ObserveId {
+        ObserveId(0)
+    }
+
+    pub fn into_inner(&self) -> usize {
+        self.0
+    }
+}
+impl From<usize> for ObserveId {
+    fn from(id: usize) -> ObserveId {
+        ObserveId(id)
+    }
+}
+
+impl From<&usize> for ObserveId {
+    fn from(id: &usize) -> ObserveId {
+        ObserveId(*id)
     }
 }
 
 pub struct ChangeObserve {
-    pub id: ObserveID,
+    pub id: ObserveId,
     pub range: ObserveRange,
 }
 
 impl Default for ChangeObserve {
     fn default() -> Self {
         ChangeObserve {
-            id: ObserveID(0),
+            id: ObserveId(0),
             range: ObserveRange::None,
         }
     }
@@ -2844,7 +2862,7 @@ pub enum ObserveRange {
 #[derive(Debug)]
 pub struct ChangeCmd {
     pub region_id: u64,
-    pub change_observe: ChangeObserve,
+    pub change_observe: Option<ChangeObserve>,
 }
 
 pub enum Msg<EK>
@@ -3252,15 +3270,13 @@ where
         region_epoch: RegionEpoch,
         cb: Callback<EK::Snapshot>,
     ) {
-        let (observe_id, region_id, range) = (
-            cmd.change_observe.id,
-            cmd.region_id,
-            cmd.change_observe.range,
-        );
+        let (region_id, change_observe) = (cmd.region_id, cmd.change_observe);
 
-        if self.delegate.change_observe.id > observe_id {
-            notify_stale_req(self.delegate.term, cb);
-            return;
+        if let Some(co) = change_observe.as_ref() {
+            if self.delegate.change_observe.id > co.id {
+                notify_stale_req(self.delegate.term, cb);
+                return;
+            }
         }
 
         assert_eq!(self.delegate.region_id(), region_id);
@@ -3276,13 +3292,10 @@ where
                 if apply_ctx.kv_wb().count() > 0 {
                     apply_ctx.commit(&mut self.delegate);
                 }
-                let snapshot = match range {
-                    ObserveRange::All => Some(RegionSnapshot::from_snapshot(
-                        Arc::new(apply_ctx.engine.snapshot()),
-                        Arc::new(self.delegate.region.clone()),
-                    )),
-                    ObserveRange::None => None,
-                };
+                let snapshot = Some(RegionSnapshot::from_snapshot(
+                    Arc::new(apply_ctx.engine.snapshot()),
+                    Arc::new(self.delegate.region.clone()),
+                ));
                 ReadResponse {
                     response: Default::default(),
                     snapshot,
@@ -3299,8 +3312,9 @@ where
                 return;
             }
         };
-        self.delegate.change_observe.id = observe_id;
-        self.delegate.change_observe.range = range;
+        if let Some(co) = change_observe {
+            self.delegate.change_observe = co;
+        }
         cb.invoke_read(resp);
     }
 
@@ -4228,13 +4242,13 @@ mod tests {
     where
         E: KvEngine,
     {
-        fn on_prepare_for_apply(&self, observe_id: ObserveID, region_id: u64) {
+        fn on_prepare_for_apply(&self, observe_id: ObserveId, region_id: u64) {
             self.cmd_batches
                 .borrow_mut()
                 .push(CmdBatch::new(observe_id, region_id));
         }
 
-        fn on_apply_cmd(&self, observe_id: ObserveID, region_id: u64, cmd: Cmd) {
+        fn on_apply_cmd(&self, observe_id: ObserveId, region_id: u64, cmd: Cmd) {
             self.cmd_batches
                 .borrow_mut()
                 .last_mut()
@@ -4652,10 +4666,10 @@ mod tests {
                 region_epoch: region_epoch.clone(),
                 cmd: ChangeCmd {
                     region_id: 1,
-                    change_observe: ChangeObserve {
-                        id: ObserveID(1),
+                    change_observe: Some(ChangeObserve {
+                        id: ObserveId(1),
                         range: ObserveRange::All,
-                    },
+                    }),
                 },
                 cb: Callback::Read(Box::new(|resp: ReadResponse<KvTestSnapshot>| {
                     assert!(!resp.response.get_header().has_error());
@@ -4677,10 +4691,10 @@ mod tests {
                 region_epoch: region_epoch.clone(),
                 cmd: ChangeCmd {
                     region_id: 1,
-                    change_observe: ChangeObserve {
-                        id: ObserveID(0),
+                    change_observe: Some(ChangeObserve {
+                        id: ObserveId(0),
                         range: ObserveRange::All,
-                    },
+                    }),
                 },
                 cb: Callback::Read(Box::new(|resp: ReadResponse<KvTestSnapshot>| {
                     assert!(resp.snapshot.is_none());
@@ -4737,10 +4751,10 @@ mod tests {
                 region_epoch: region_epoch.clone(),
                 cmd: ChangeCmd {
                     region_id: 1,
-                    change_observe: ChangeObserve {
-                        id: ObserveID(2),
+                    change_observe: Some(ChangeObserve {
+                        id: ObserveId(2),
                         range: ObserveRange::None,
-                    },
+                    }),
                 },
                 cb: Callback::Read(Box::new(|resp: ReadResponse<KvTestSnapshot>| {
                     assert!(resp.snapshot.is_none());
@@ -4764,10 +4778,10 @@ mod tests {
                 region_epoch,
                 cmd: ChangeCmd {
                     region_id: 2,
-                    change_observe: ChangeObserve {
-                        id: ObserveID(3),
+                    change_observe: Some(ChangeObserve {
+                        id: ObserveId(3),
                         range: ObserveRange::All,
-                    },
+                    }),
                 },
                 cb: Callback::Read(Box::new(|resp: ReadResponse<_>| {
                     assert!(resp
@@ -4939,10 +4953,10 @@ mod tests {
                 region_epoch: region_epoch.clone(),
                 cmd: ChangeCmd {
                     region_id: 1,
-                    change_observe: ChangeObserve {
-                        id: ObserveID::new(),
+                    change_observe: Some(ChangeObserve {
+                        id: ObserveId::new(),
                         range: ObserveRange::All,
-                    },
+                    }),
                 },
                 cb: Callback::Read(Box::new(|resp: ReadResponse<_>| {
                     assert!(!resp.response.get_header().has_error(), "{:?}", resp);
@@ -5099,10 +5113,10 @@ mod tests {
                 region_epoch,
                 cmd: ChangeCmd {
                     region_id: 1,
-                    change_observe: ChangeObserve {
-                        id: ObserveID::new(),
+                    change_observe: Some(ChangeObserve {
+                        id: ObserveId::new(),
                         range: ObserveRange::None,
-                    },
+                    }),
                 },
                 cb: Callback::Read(Box::new(move |resp: ReadResponse<_>| {
                     assert!(

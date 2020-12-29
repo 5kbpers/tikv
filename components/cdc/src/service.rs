@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use collections::HashMap;
+use engine_traits::Snapshot;
 use futures::future::{self, TryFutureExt};
 use futures::sink::SinkExt;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -21,7 +22,7 @@ use security::{check_common_name, SecurityManager};
 use tikv_util::mpsc::batch::{self, BatchReceiver, Sender as BatchSender, VecCollector};
 use tikv_util::worker::*;
 
-use crate::delegate::{Downstream, DownstreamID};
+use crate::delegate::{Downstream, DownstreamId};
 use crate::endpoint::{Deregister, Task};
 
 static CONNECTION_ID_ALLOC: AtomicUsize = AtomicUsize::new(0);
@@ -158,7 +159,7 @@ bitflags::bitflags! {
 pub struct Conn {
     id: ConnID,
     sink: BatchSender<CdcEvent>,
-    downstreams: HashMap<u64, DownstreamID>,
+    downstreams: HashMap<u64, DownstreamId>,
     peer: String,
     version: Option<(semver::Version, FeatureGate)>,
 }
@@ -220,7 +221,7 @@ impl Conn {
         self.id
     }
 
-    pub fn take_downstreams(self) -> HashMap<u64, DownstreamID> {
+    pub fn take_downstreams(self) -> HashMap<u64, DownstreamId> {
         self.downstreams
     }
 
@@ -228,7 +229,7 @@ impl Conn {
         self.sink.clone()
     }
 
-    pub fn subscribe(&mut self, region_id: u64, downstream_id: DownstreamID) -> bool {
+    pub fn subscribe(&mut self, region_id: u64, downstream_id: DownstreamId) -> bool {
         match self.downstreams.entry(region_id) {
             Entry::Occupied(_) => false,
             Entry::Vacant(v) => {
@@ -242,7 +243,7 @@ impl Conn {
         self.downstreams.remove(&region_id);
     }
 
-    pub fn downstream_id(&self, region_id: u64) -> Option<DownstreamID> {
+    pub fn downstream_id(&self, region_id: u64) -> Option<DownstreamId> {
         self.downstreams.get(&region_id).copied()
     }
 
@@ -259,16 +260,16 @@ impl Conn {
 ///
 /// It's a front-end of the CDC service, schedules requests to the `Endpoint`.
 #[derive(Clone)]
-pub struct Service {
-    scheduler: Scheduler<Task>,
+pub struct Service<S: Snapshot> {
+    scheduler: Scheduler<Task<S>>,
     security_mgr: Arc<SecurityManager>,
 }
 
-impl Service {
+impl<S: Snapshot> Service<S> {
     /// Create a ChangeData service.
     ///
     /// It requires a scheduler of an `Endpoint` in order to schedule tasks.
-    pub fn new(scheduler: Scheduler<Task>, security_mgr: Arc<SecurityManager>) -> Service {
+    pub fn new(scheduler: Scheduler<Task<S>>, security_mgr: Arc<SecurityManager>) -> Self {
         Service {
             scheduler,
             security_mgr,
@@ -276,7 +277,7 @@ impl Service {
     }
 }
 
-impl ChangeData for Service {
+impl<S: Snapshot> ChangeData for Service<S> {
     fn event_feed(
         &mut self,
         ctx: RpcContext,

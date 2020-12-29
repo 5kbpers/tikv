@@ -7,11 +7,12 @@ use std::sync::{Arc, Mutex};
 
 use crossbeam::atomic::AtomicCell;
 use engine_traits::{KvEngine, Snapshot};
+use kvproto::errorpb;
 use kvproto::metapb::Region;
 use raft::StateRole;
 use raftstore::coprocessor::CmdBatch;
 use raftstore::router::RaftStoreRouter;
-use raftstore::store::fsm::{ChangeCmd, ChangeObserve, ObserveID, ObserveRange, StoreMeta};
+use raftstore::store::fsm::{ChangeCmd, ChangeObserve, ObserveId, ObserveRange, StoreMeta};
 use raftstore::store::msg::{Callback, SignificantMsg};
 use raftstore::store::util::RemoteLease;
 use raftstore::store::RegionSnapshot;
@@ -48,7 +49,7 @@ enum PendingLock {
 
 struct ObserveRegion {
     meta: Region,
-    observe_id: ObserveID,
+    observe_id: ObserveId,
     // TODO: Get lease from raftstore.
     lease: Option<RemoteLease>,
     resolver: Resolver,
@@ -60,7 +61,7 @@ impl ObserveRegion {
         ObserveRegion {
             resolver: Resolver::from_resolved_ts(meta.id, resolved_ts),
             meta,
-            observe_id: ObserveID::new(),
+            observe_id: ObserveId::new(),
             lease: None,
             resolver_status: ResolverStatus::Pending {
                 locks: vec![],
@@ -101,40 +102,35 @@ impl ObserveRegion {
         }
     }
 
-    fn track_scan_locks(&mut self, entries: Vec<ScanEntry>) {
-        for es in entries {
-            match es {
-                ScanEntry::Lock(locks) => {
-                    if let ResolverStatus::Ready = self.resolver_status {
-                        panic!("region {:?} resolver has ready", self.meta.id)
-                    }
-                    for (key, lock) in locks {
-                        self.resolver.track_lock(lock.ts, &key);
-                    }
+    fn track_scan_locks(&mut self, entry: ScanEntry) {
+        match entry {
+            ScanEntry::Lock(locks) => {
+                if let ResolverStatus::Ready = self.resolver_status {
+                    panic!("region {:?} resolver has ready", self.meta.id)
                 }
-                ScanEntry::None => {
-                    let status =
-                        std::mem::replace(&mut self.resolver_status, ResolverStatus::Ready);
-                    match status {
-                        ResolverStatus::Pending { locks, .. } => {
-                            locks.into_iter().for_each(|lock| match lock {
-                                PendingLock::Track { key, start_ts } => {
-                                    self.resolver.track_lock(start_ts, &key)
-                                }
-                                PendingLock::Untrack {
-                                    key,
-                                    start_ts,
-                                    commit_ts,
-                                } => self.resolver.untrack_lock(start_ts, commit_ts, &key),
-                            })
-                        }
-                        ResolverStatus::Ready => {
-                            panic!("region {:?} resolver has ready", self.meta.id)
-                        }
-                    }
+                for (key, lock) in locks {
+                    self.resolver.track_lock(lock.ts, &key);
                 }
-                ScanEntry::TxnEntry(_) => panic!("unexpected entry type"),
             }
+            ScanEntry::None => {
+                let status = std::mem::replace(&mut self.resolver_status, ResolverStatus::Ready);
+                match status {
+                    ResolverStatus::Pending { locks, .. } => {
+                        locks.into_iter().for_each(|lock| match lock {
+                            PendingLock::Track { key, start_ts } => {
+                                self.resolver.track_lock(start_ts, &key)
+                            }
+                            PendingLock::Untrack {
+                                key,
+                                start_ts,
+                                commit_ts,
+                            } => self.resolver.untrack_lock(start_ts, commit_ts, &key),
+                        })
+                    }
+                    ResolverStatus::Ready => panic!("region {:?} resolver has ready", self.meta.id),
+                }
+            }
+            ScanEntry::TxnEntry(_) => panic!("unexpected entry type"),
         }
     }
 }
@@ -194,28 +190,28 @@ where
         let scheduler = self.scheduler.clone();
         let scheduler1 = self.scheduler.clone();
         let scan_task = ScanTask {
-            id: observe_region.observe_id,
+            id: observe_region.observe_id.into_inner(),
             tag: String::new(),
             mode: ScanMode::LockOnly,
             region,
             checkpoint_ts: TimeStamp::zero(),
             cancelled: Box::new(move || cancelled.load(Ordering::Acquire)),
-            send_entries: Box::new(move |entries| {
+            send_entries: Box::new(move |entry| {
                 scheduler
                     .schedule(Task::ScanLocks {
                         region_id,
                         observe_id,
-                        entries,
+                        entry,
                     })
                     .unwrap_or_else(|e| debug!("schedule resolved ts task failed"; "err" => ?e));
             }),
             before_start: None,
-            on_error: Some(Box::new(move |observe_id, region, err| {
+            on_error: Some(Box::new(move |region, error| {
                 scheduler1
                     .schedule(Task::RegionError {
                         observe_id,
                         region,
-                        error: err,
+                        error,
                     })
                     .unwrap();
             })),
@@ -236,10 +232,10 @@ where
             SignificantMsg::CaptureChange {
                 cmd: ChangeCmd {
                     region_id,
-                    change_observe: ChangeObserve {
+                    change_observe: Some(ChangeObserve {
                         id: observe_id,
                         range: ObserveRange::None,
-                    },
+                    }),
                 },
                 region_epoch: region.get_region_epoch().clone(),
                 callback: Callback::None,
@@ -280,7 +276,7 @@ where
         }
     }
 
-    fn region_error(&mut self, region: Region, observe_id: ObserveID, error: Error) {
+    fn region_error(&mut self, region: Region, observe_id: ObserveId, error: Error) {
         if let Some(observe_region) = self.regions.get(&region.id) {
             if observe_region.observe_id != observe_id {
                 return;
@@ -327,7 +323,7 @@ where
                                 _ => (),
                             }
                         }
-                        return Some(SinkCmd::ChangeLog {
+                        return Some(SinkCmd {
                             logs: change_logs,
                             region_id,
                             observe_id: observe_region.observe_id,
@@ -349,16 +345,11 @@ where
         }
     }
 
-    fn handle_scan_locks(
-        &mut self,
-        region_id: u64,
-        observe_id: ObserveID,
-        entries: Vec<ScanEntry>,
-    ) {
+    fn handle_scan_locks(&mut self, region_id: u64, observe_id: ObserveId, entry: ScanEntry) {
         match self.regions.get_mut(&region_id) {
             Some(observe_region) => {
                 if observe_region.observe_id == observe_id {
-                    observe_region.track_scan_locks(entries);
+                    observe_region.track_scan_locks(entry);
                 }
             }
             None => {
@@ -382,7 +373,7 @@ pub enum Task<S: Snapshot> {
     },
     RegionError {
         region: Region,
-        observe_id: ObserveID,
+        observe_id: ObserveId,
         error: Error,
     },
     RegisterAdvanceEvent,
@@ -396,10 +387,9 @@ pub enum Task<S: Snapshot> {
     },
     ScanLocks {
         region_id: u64,
-        observe_id: ObserveID,
-        entries: Vec<ScanEntry>,
+        observe_id: ObserveId,
+        entry: ScanEntry,
     },
-    FetchResolvedTs {},
 }
 
 impl<S: Snapshot> fmt::Debug for Task<S> {
@@ -451,7 +441,6 @@ impl<S: Snapshot> fmt::Debug for Task<S> {
                 .field("observe_id", &observe_id)
                 .finish(),
             Task::RegisterAdvanceEvent => de.field("name", &"register_advance_event").finish(),
-            $0Task::FetchResolvedTs {  } => {}
         }
     }
 }
@@ -489,8 +478,8 @@ where
             Task::ScanLocks {
                 region_id,
                 observe_id,
-                entries,
-            } => self.handle_scan_locks(region_id, observe_id, entries),
+                entry,
+            } => self.handle_scan_locks(region_id, observe_id, entry),
             Task::RegisterAdvanceEvent => self.register_advance_event(),
         }
     }

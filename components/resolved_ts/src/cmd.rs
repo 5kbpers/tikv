@@ -1,11 +1,11 @@
 use collections::HashMap;
 use kvproto::errorpb;
-use kvproto::raft_cmdpb::{AdminCmdType, AdminRequest, AdminResponse, CmdType, Request};
+use kvproto::raft_cmdpb::{AdminCmdType, CmdType, Request};
 use raftstore::coprocessor::{Cmd, CmdBatch};
 use raftstore::errors::Error as RaftStoreError;
-use raftstore::store::fsm::ObserveID;
 use txn_types::{Key, Lock, LockType, TimeStamp, Value, Write, WriteRef, WriteType};
 
+#[derive(Debug)]
 pub enum ChangeRow {
     Prewrite {
         key: Key,
@@ -16,8 +16,6 @@ pub enum ChangeRow {
         key: Key,
         write: Write,
         commit_ts: Option<TimeStamp>,
-        // Define it for one PC.
-        value: Option<Value>,
     },
 }
 
@@ -28,7 +26,6 @@ pub enum ChangeLog {
         // (index, change rows)
         rows: Vec<ChangeRow>,
     },
-    None,
 }
 
 impl ChangeLog {
@@ -44,7 +41,7 @@ impl ChangeLog {
                 if !response.get_header().has_error() {
                     if !request.has_admin_request() {
                         let rows = Self::encode_rows(request.requests.into());
-                        ChangeLog::Rows { index, rows }
+                        Some(ChangeLog::Rows { index, rows })
                     } else {
                         let mut response = response.take_admin_response();
                         let error = match request.take_admin_request().get_cmd_type() {
@@ -66,13 +63,14 @@ impl ChangeLog {
                             }
                             _ => None,
                         };
-                        error.map_or(ChangeLog::None, |e| ChangeLog::Error(e.into()))
+                        error.map(|e| ChangeLog::Error(e.into()))
                     }
                 } else {
                     let err_header = response.mut_header().take_error();
-                    ChangeLog::Error(err_header.into())
+                    Some(ChangeLog::Error(err_header.into()))
                 }
             })
+            .filter_map(|v| v)
             .collect()
     }
 
@@ -109,7 +107,6 @@ impl ChangeLog {
                                 key,
                                 commit_ts,
                                 write,
-                                value: None,
                             },
                         );
                         assert!(l.is_none());
@@ -136,10 +133,8 @@ impl ChangeLog {
                             assert_eq!(start_ts, lock.ts);
                             *value = Some(put.take_value());
                         }
-                        Some(ChangeRow::Commit { value, write, .. }) => {
-                            assert!(value.is_none());
+                        Some(ChangeRow::Commit { write, .. }) => {
                             assert_eq!(start_ts, write.start_ts);
-                            *value = Some(put.take_value());
                         }
                         None => {
                             pending_default.insert(key, put.take_value());
@@ -155,7 +150,7 @@ impl ChangeLog {
     }
 }
 
-fn decode_write(key: &[u8], value: &[u8]) -> Option<Write> {
+pub(crate) fn decode_write(key: &[u8], value: &[u8]) -> Option<Write> {
     let write = WriteRef::parse(value).unwrap().to_owned();
     match write.write_type {
         WriteType::Put | WriteType::Delete | WriteType::Rollback => Some(write),
@@ -166,7 +161,7 @@ fn decode_write(key: &[u8], value: &[u8]) -> Option<Write> {
     }
 }
 
-fn decode_lock(key: &[u8], value: &[u8]) -> Option<Lock> {
+pub(crate) fn decode_lock(key: &[u8], value: &[u8]) -> Option<Lock> {
     let lock = Lock::parse(value).unwrap();
     match lock.lock_type {
         LockType::Put | LockType::Delete => Some(lock),

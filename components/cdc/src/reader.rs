@@ -12,7 +12,7 @@ use engine_traits::{
 use kvproto::metapb::{Peer, Region};
 use raft::StateRole;
 use raftstore::coprocessor::*;
-use raftstore::store::fsm::ObserveID;
+use raftstore::store::fsm::ObserveId;
 use raftstore::store::RegionSnapshot;
 use raftstore::Error as RaftStoreError;
 use tikv::storage::{Cursor, ScanMode, Snapshot as EngineSnapshot, Statistics};
@@ -24,12 +24,12 @@ use crate::endpoint::{Deregister, OldValueCache, Task};
 use crate::metrics::*;
 use crate::{Error as CdcError, Result};
 
-struct OldValueReader<S: EngineSnapshot> {
+pub struct OldValueReader<S: EngineSnapshot> {
     snapshot: S,
 }
 
 impl<S: EngineSnapshot> OldValueReader<S> {
-    fn new(snapshot: S) -> Self {
+    pub fn new(snapshot: S) -> Self {
         Self { snapshot }
     }
 
@@ -49,7 +49,7 @@ impl<S: EngineSnapshot> OldValueReader<S> {
 
     // return Some(vec![]) if value is empty.
     // return None if key not exist.
-    fn get_value_default(&mut self, key: &Key, statistics: &mut Statistics) -> Option<Value> {
+    pub fn get_value_default(&mut self, key: &Key, statistics: &mut Statistics) -> Option<Value> {
         statistics.data.get += 1;
         let mut opts = ReadOptions::new();
         opts.set_fill_cache(false);
@@ -77,7 +77,7 @@ impl<S: EngineSnapshot> OldValueReader<S> {
 
     // return Some(vec![]) if value is empty.
     // return None if key not exist.
-    fn near_seek_old_value(
+    pub fn near_seek_old_value(
         &mut self,
         key: &Key,
         statistics: &mut Statistics,
@@ -145,7 +145,7 @@ mod tests {
     fn test_register_and_deregister() {
         let (scheduler, mut rx) = tikv_util::worker::dummy_scheduler();
         let observer = CdcObserver::new(scheduler);
-        let observe_id = ObserveID::new();
+        let observe_id = ObserveId::new();
         let engine = TestEngineBuilder::new().build().unwrap().get_rocksdb();
 
         <CdcObserver as CmdObserver<RocksEngine>>::on_prepare_for_apply(&observer, observe_id, 0);
@@ -172,7 +172,7 @@ mod tests {
         observer.on_role_change(&mut ctx, StateRole::Follower);
         rx.recv_timeout(Duration::from_millis(10)).unwrap_err();
 
-        let oid = ObserveID::new();
+        let oid = ObserveId::new();
         observer.subscribe_region(1, oid);
         let mut ctx = ObserverContext::new(&region);
         observer.on_role_change(&mut ctx, StateRole::Follower);

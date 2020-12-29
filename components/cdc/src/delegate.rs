@@ -1,13 +1,10 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::cell::RefCell;
-use std::mem;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use collections::HashMap;
 use crossbeam::atomic::AtomicCell;
+use engine_traits::Snapshot;
 #[cfg(feature = "prost-codec")]
 use kvproto::cdcpb::{
     event::{
@@ -23,21 +20,19 @@ use kvproto::cdcpb::{
 };
 use kvproto::errorpb;
 use kvproto::kvrpcpb::ExtraOp as TxnExtraOp;
-use kvproto::metapb::{Region, RegionEpoch};
-use kvproto::raft_cmdpb::{AdminCmdType, AdminRequest, AdminResponse, CmdType, Request};
-use raftstore::coprocessor::{Cmd, CmdBatch};
-use raftstore::store::fsm::ObserveID;
-use raftstore::store::util::compare_region_epoch;
-use raftstore::Error as RaftStoreError;
-use resolved_ts::Resolver;
+use kvproto::metapb::RegionEpoch;
+use raftstore::store::fsm::ObserveId;
+use raftstore::store::RegionSnapshot;
+use resolved_ts::{ChangeLog, ChangeRow, ScanEntry, SinkCmd};
 use tikv::storage::txn::TxnEntry;
-use tikv::storage::Statistics;
+use tikv::storage::{Snapshot as EngineSnapshot, Statistics};
 use tikv_util::mpsc::batch::Sender as BatchSender;
 use tikv_util::time::Instant;
-use txn_types::{Key, Lock, LockType, TimeStamp, WriteRef, WriteType};
+use txn_types::{Key, Lock, LockType, MutationType, TimeStamp, Value, WriteType};
 
-use crate::endpoint::{OldValueCache, OldValueCallback};
+use crate::endpoint::OldValueCache;
 use crate::metrics::*;
+use crate::reader::OldValueReader;
 use crate::service::{CdcEvent, ConnID};
 use crate::{Error, Result};
 
@@ -46,11 +41,27 @@ static DOWNSTREAM_ID_ALLOC: AtomicUsize = AtomicUsize::new(0);
 
 /// A unique identifier of a Downstream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct DownstreamID(usize);
+pub struct DownstreamId(usize);
 
-impl DownstreamID {
-    pub fn new() -> DownstreamID {
-        DownstreamID(DOWNSTREAM_ID_ALLOC.fetch_add(1, Ordering::SeqCst))
+impl DownstreamId {
+    pub fn new() -> DownstreamId {
+        DownstreamId(DOWNSTREAM_ID_ALLOC.fetch_add(1, Ordering::SeqCst))
+    }
+
+    pub fn into_inner(&self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for DownstreamId {
+    fn from(id: usize) -> DownstreamId {
+        DownstreamId(id)
+    }
+}
+
+impl From<&usize> for DownstreamId {
+    fn from(id: &usize) -> DownstreamId {
+        DownstreamId(*id)
     }
 }
 
@@ -71,7 +82,8 @@ impl Default for DownstreamState {
 pub struct Downstream {
     // TODO: include cdc request.
     /// A unique identifier of the Downstream.
-    id: DownstreamID,
+    pub id: DownstreamId,
+    pub state: Arc<AtomicCell<DownstreamState>>,
     // The reqeust ID set by CDC to identify events corresponding different requests.
     req_id: u64,
     conn_id: ConnID,
@@ -79,7 +91,7 @@ pub struct Downstream {
     peer: String,
     region_epoch: RegionEpoch,
     sink: Option<BatchSender<CdcEvent>>,
-    state: Arc<AtomicCell<DownstreamState>>,
+    start_log_index: u64,
 }
 
 impl Downstream {
@@ -94,13 +106,14 @@ impl Downstream {
         conn_id: ConnID,
     ) -> Downstream {
         Downstream {
-            id: DownstreamID::new(),
+            id: DownstreamId::new(),
             req_id,
             conn_id,
             peer,
             region_epoch,
             sink: None,
             state: Arc::new(AtomicCell::new(DownstreamState::default())),
+            start_log_index: 0,
         }
     }
 
@@ -132,7 +145,7 @@ impl Downstream {
         self.sink = Some(sink);
     }
 
-    pub fn get_id(&self) -> DownstreamID {
+    pub fn get_id(&self) -> DownstreamId {
         self.id
     }
 
@@ -166,53 +179,14 @@ impl Downstream {
     }
 }
 
-#[derive(Default)]
-struct Pending {
-    pub downstreams: Vec<Downstream>,
-    pub locks: Vec<PendingLock>,
-    pub pending_bytes: usize,
-}
-
-impl Drop for Pending {
-    fn drop(&mut self) {
-        CDC_PENDING_BYTES_GAUGE.sub(self.pending_bytes as i64);
-    }
-}
-
-impl Pending {
-    fn take_downstreams(&mut self) -> Vec<Downstream> {
-        mem::take(&mut self.downstreams)
-    }
-
-    fn take_locks(&mut self) -> Vec<PendingLock> {
-        mem::take(&mut self.locks)
-    }
-}
-
-enum PendingLock {
-    Track {
-        key: Vec<u8>,
-        start_ts: TimeStamp,
-    },
-    Untrack {
-        key: Vec<u8>,
-        start_ts: TimeStamp,
-        commit_ts: Option<TimeStamp>,
-    },
-}
-
 /// A CDC delegate of a raftstore region peer.
 ///
 /// It converts raft commands into CDC events and broadcast to downstreams.
 /// It also track trancation on the fly in order to compute resolved ts.
 pub struct Delegate {
-    pub id: ObserveID,
+    pub id: ObserveId,
     pub region_id: u64,
-    region: Option<Region>,
     pub downstreams: Vec<Downstream>,
-    pub resolver: Option<Resolver>,
-    pending: Option<Pending>,
-    enabled: Arc<AtomicBool>,
     failed: bool,
     pub txn_extra_op: TxnExtraOp,
 }
@@ -222,76 +196,37 @@ impl Delegate {
     pub fn new(region_id: u64) -> Delegate {
         Delegate {
             region_id,
-            id: ObserveID::new(),
+            id: ObserveId::new(),
             downstreams: Vec::new(),
-            resolver: None,
-            region: None,
-            pending: Some(Pending::default()),
-            enabled: Arc::new(AtomicBool::new(true)),
             failed: false,
             txn_extra_op: TxnExtraOp::default(),
         }
     }
 
-    /// Returns a shared flag.
-    /// True if there are some active downstreams subscribe the region.
-    /// False if all downstreams has unsubscribed.
-    pub fn enabled(&self) -> Arc<AtomicBool> {
-        self.enabled.clone()
-    }
-
     /// Return false if subscribe failed.
-    pub fn subscribe(&mut self, downstream: Downstream) -> bool {
-        if let Some(region) = self.region.as_ref() {
-            if let Err(e) = compare_region_epoch(
-                &downstream.region_epoch,
-                region,
-                false, /* check_conf_ver */
-                true,  /* check_ver */
-                true,  /* include_region */
-            ) {
-                info!("fail to subscribe downstream";
-                    "region_id" => region.get_id(),
-                    "downstream_id" => ?downstream.get_id(),
-                    "conn_id" => ?downstream.get_conn_id(),
-                    "req_id" => downstream.req_id,
-                    "err" => ?e);
-                let err = Error::Request(e.into());
-                let change_data_error = self.error_event(err);
-                downstream.sink_event(change_data_error);
-                return false;
-            }
-            self.downstreams.push(downstream);
-        } else {
-            self.pending.as_mut().unwrap().downstreams.push(downstream);
-        }
-        true
+    pub fn subscribe(&mut self, downstream: Downstream) {
+        self.downstreams.push(downstream);
     }
 
-    pub fn downstream(&self, downstream_id: DownstreamID) -> Option<&Downstream> {
+    pub fn downstream(&self, downstream_id: DownstreamId) -> Option<&Downstream> {
         self.downstreams.iter().find(|d| d.id == downstream_id)
     }
 
-    pub fn downstreams(&self) -> &Vec<Downstream> {
-        if self.pending.is_some() {
-            &self.pending.as_ref().unwrap().downstreams
-        } else {
-            &self.downstreams
+    pub fn downstream_mut(&mut self, downstream_id: DownstreamId) -> Option<&mut Downstream> {
+        self.downstreams.iter_mut().find(|d| d.id == downstream_id)
+    }
+
+    pub fn init_downstream(&mut self, downstream_id: DownstreamId, index: u64) {
+        if let Some(downstream) = self.downstream_mut(downstream_id) {
+            let state = downstream.get_state();
+            state.compare_and_swap(DownstreamState::Uninitialized, DownstreamState::Normal);
+            downstream.start_log_index = index;
         }
     }
 
-    pub fn downstreams_mut(&mut self) -> &mut Vec<Downstream> {
-        if self.pending.is_some() {
-            &mut self.pending.as_mut().unwrap().downstreams
-        } else {
-            &mut self.downstreams
-        }
-    }
-
-    pub fn unsubscribe(&mut self, id: DownstreamID, err: Option<Error>) -> bool {
+    pub fn unsubscribe(&mut self, id: DownstreamId, err: Option<Error>) -> bool {
         let change_data_error = err.map(|err| self.error_event(err));
-        let downstreams = self.downstreams_mut();
-        downstreams.retain(|d| {
+        self.downstreams.retain(|d| {
             if d.id == id {
                 if let Some(change_data_error) = change_data_error.clone() {
                     d.sink_event(change_data_error);
@@ -300,10 +235,7 @@ impl Delegate {
             }
             d.id != id
         });
-        let is_last = downstreams.is_empty();
-        if is_last {
-            self.enabled.store(false, Ordering::SeqCst);
-        }
+        let is_last = self.downstreams.is_empty();
         is_last
     }
 
@@ -342,197 +274,88 @@ impl Delegate {
     /// It broadcasts errors to all downstream and stops.
     pub fn stop(&mut self, err: Error) {
         self.mark_failed();
-        // Stop observe further events.
-        self.enabled.store(false, Ordering::SeqCst);
 
         info!("region met error";
             "region_id" => self.region_id, "error" => ?err);
-        let change_data_err = self.error_event(err);
         for d in &self.downstreams {
             d.state.store(DownstreamState::Stopped);
         }
-        self.broadcast(change_data_err, false);
+        self.broadcast_error(err);
     }
 
-    fn broadcast(&self, change_data_event: Event, normal_only: bool) {
-        let downstreams = self.downstreams();
+    fn broadcast_error(&self, err: Error) {
         assert!(
-            !downstreams.is_empty(),
-            "region {} miss downstream, event: {:?}",
-            self.region_id,
-            change_data_event,
+            !self.downstreams.is_empty(),
+            "region {} miss downstream",
+            self.region_id
         );
-        for downstream in downstreams {
-            if normal_only && downstream.state.load() != DownstreamState::Normal {
+        let change_data_err = self.error_event(err);
+        for downstream in &self.downstreams {
+            downstream.sink_event(change_data_err);
+        }
+    }
+
+    fn broadcast_entries(&self, index: u64, event_entries: EventEntries) {
+        assert!(
+            !self.downstreams.is_empty(),
+            "region {} miss downstream",
+            self.region_id
+        );
+        let mut change_data_event = Event::default();
+        change_data_event.region_id = self.region_id;
+        change_data_event.index = index;
+        change_data_event.event = Some(Event_oneof_event::Entries(event_entries));
+        for downstream in &self.downstreams {
+            if downstream.state.load() != DownstreamState::Normal
+                || downstream.start_log_index <= index
+            {
                 continue;
             }
             downstream.sink_event(change_data_event.clone());
         }
     }
 
-    /// Install a resolver and return pending downstreams.
-    pub fn on_region_ready(&mut self, mut resolver: Resolver, region: Region) -> Vec<Downstream> {
-        assert!(
-            self.resolver.is_none(),
-            "region {} resolver should not be ready",
-            self.region_id,
-        );
-        // Mark the delegate as initialized.
-        self.region = Some(region);
-        let mut pending = self.pending.take().unwrap();
-        for lock in pending.take_locks() {
-            match lock {
-                PendingLock::Track { key, start_ts } => resolver.track_lock(start_ts, key),
-                PendingLock::Untrack {
-                    key,
-                    start_ts,
-                    commit_ts,
-                } => resolver.untrack_lock(start_ts, commit_ts, key),
-            }
-        }
-        self.resolver = Some(resolver);
-        info!("region is ready"; "region_id" => self.region_id);
-        pending.take_downstreams()
-    }
-
-    /// Try advance and broadcast resolved ts.
-    pub fn on_min_ts(&mut self, min_ts: TimeStamp) -> Option<TimeStamp> {
-        if self.resolver.is_none() {
-            debug!("region resolver not ready";
-                "region_id" => self.region_id, "min_ts" => min_ts);
-            return None;
-        }
-        debug!("try to advance ts"; "region_id" => self.region_id, "min_ts" => min_ts);
-        let resolver = self.resolver.as_mut().unwrap();
-        let resolved_ts = match resolver.resolve(min_ts) {
-            Some(rts) => rts,
-            None => return None,
-        };
-        debug!("resolved ts updated";
-            "region_id" => self.region_id, "resolved_ts" => resolved_ts);
-        CDC_RESOLVED_TS_GAP_HISTOGRAM
-            .observe((min_ts.physical() - resolved_ts.physical()) as f64 / 1000f64);
-        Some(resolved_ts)
-    }
-
-    pub fn on_batch(
-        &mut self,
-        batch: CmdBatch,
-        old_value_cb: Rc<RefCell<OldValueCallback>>,
-        old_value_cache: &mut OldValueCache,
-    ) -> Result<()> {
-        // Stale CmdBatch, drop it sliently.
-        if batch.observe_id != self.id {
-            return Ok(());
-        }
-        for cmd in batch.into_iter(self.region_id) {
-            let Cmd {
-                index,
-                mut request,
-                mut response,
-            } = cmd;
-            if !response.get_header().has_error() {
-                if !request.has_admin_request() {
-                    self.sink_data(
-                        index,
-                        request.requests.into(),
-                        old_value_cb.clone(),
-                        old_value_cache,
-                    )?;
-                } else {
-                    self.sink_admin(request.take_admin_request(), response.take_admin_response())?;
-                }
-            } else {
-                let err_header = response.mut_header().take_error();
-                self.mark_failed();
-                return Err(Error::Request(err_header));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn on_scan(&mut self, downstream_id: DownstreamID, entries: Vec<Option<TxnEntry>>) {
-        let downstreams = if let Some(pending) = self.pending.as_mut() {
-            &pending.downstreams
-        } else {
-            &self.downstreams
-        };
-        let downstream = if let Some(d) = downstreams.iter().find(|d| d.id == downstream_id) {
+    pub fn on_scan(&mut self, downstream_id: DownstreamId, entry: ScanEntry) {
+        let downstream = if let Some(d) = self.downstreams.iter().find(|d| d.id == downstream_id) {
             d
         } else {
             warn!("downstream not found"; "downstream_id" => ?downstream_id, "region_id" => self.region_id);
             return;
         };
+        let rows = match entry {
+            ScanEntry::TxnEntry(rows) => rows,
+            ScanEntry::None => {
+                let mut row = EventRow::default();
+                // This type means scan has finished.
+                set_event_row_type(&mut row, EventLogType::Initialized);
+                let mut event_entries = EventEntries::default();
+                event_entries.mut_entries().push(row);
+                let mut event = Event::default();
+                event.region_id = self.region_id;
+                event.event = Some(Event_oneof_event::Entries(event_entries));
+                downstream.sink_event(event);
+                return;
+            }
+            _ => panic!(),
+        };
 
-        let entries_len = entries.len();
-        let mut rows = vec![Vec::with_capacity(entries_len)];
+        let entries_len = rows.len();
+        let mut event_rows = vec![Vec::with_capacity(entries_len)];
         let mut current_rows_size: usize = 0;
-        for entry in entries {
-            match entry {
-                Some(TxnEntry::Prewrite {
-                    default,
-                    lock,
-                    old_value,
-                }) => {
-                    let mut row = EventRow::default();
-                    let skip = decode_lock(lock.0, &lock.1, &mut row);
-                    if skip {
-                        continue;
-                    }
-                    decode_default(default.1, &mut row);
-                    let row_size = row.key.len() + row.value.len();
-                    if current_rows_size + row_size >= EVENT_MAX_SIZE {
-                        rows.push(Vec::with_capacity(entries_len));
-                        current_rows_size = 0;
-                    }
-                    current_rows_size += row_size;
-                    row.old_value = old_value.unwrap_or_default();
-                    rows.last_mut().unwrap().push(row);
+        for (r, old_value) in rows {
+            if let Some((row, _)) = decode_change_row(r) {
+                row.old_value = old_value.unwrap_or_default();
+                let row_size = row.key.len() + row.value.len() + row.old_value.len();
+                if current_rows_size + row_size >= EVENT_MAX_SIZE {
+                    event_rows.push(Vec::with_capacity(entries_len));
+                    current_rows_size = 0;
                 }
-                Some(TxnEntry::Commit {
-                    default,
-                    write,
-                    old_value,
-                }) => {
-                    let mut row = EventRow::default();
-                    let skip = decode_write(write.0, &write.1, &mut row);
-                    if skip {
-                        continue;
-                    }
-                    decode_default(default.1, &mut row);
-
-                    // This type means the row is self-contained, it has,
-                    //   1. start_ts
-                    //   2. commit_ts
-                    //   3. key
-                    //   4. value
-                    if row.get_type() == EventLogType::Rollback {
-                        // We dont need to send rollbacks to downstream,
-                        // because downstream does not needs rollback to clean
-                        // prewrite as it drops all previous stashed data.
-                        continue;
-                    }
-                    set_event_row_type(&mut row, EventLogType::Committed);
-                    row.old_value = old_value.unwrap_or_default();
-                    let row_size = row.key.len() + row.value.len();
-                    if current_rows_size + row_size >= EVENT_MAX_SIZE {
-                        rows.push(Vec::with_capacity(entries_len));
-                        current_rows_size = 0;
-                    }
-                    current_rows_size += row_size;
-                    rows.last_mut().unwrap().push(row);
-                }
-                None => {
-                    let mut row = EventRow::default();
-
-                    // This type means scan has finised.
-                    set_event_row_type(&mut row, EventLogType::Initialized);
-                    rows.last_mut().unwrap().push(row);
-                }
+                current_rows_size += row_size;
+                event_rows.last_mut().unwrap().push(row);
             }
         }
 
-        for rs in rows {
+        for rs in event_rows {
             if !rs.is_empty() {
                 let mut event_entries = EventEntries::default();
                 event_entries.entries = rs.into();
@@ -544,167 +367,93 @@ impl Delegate {
         }
     }
 
-    fn sink_data(
+    pub fn on_sink_cmd<S: Snapshot>(
         &mut self,
-        index: u64,
-        requests: Vec<Request>,
-        old_value_cb: Rc<RefCell<OldValueCallback>>,
+        cmd: SinkCmd,
+        snapshot: RegionSnapshot<S>,
         old_value_cache: &mut OldValueCache,
     ) -> Result<()> {
-        let mut rows = HashMap::default();
-        for mut req in requests {
-            // CDC cares about put requests only.
-            if req.get_cmd_type() != CmdType::Put {
-                // Do not log delete requests because they are issued by GC
-                // frequently.
-                if req.get_cmd_type() != CmdType::Delete {
-                    debug!(
-                        "skip other command";
-                        "region_id" => self.region_id,
-                        "command" => ?req,
-                    );
+        let reader = OldValueReader::new(snapshot);
+        for log in cmd.logs {
+            match log {
+                ChangeLog::Error(e) => {
+                    self.mark_failed();
+                    return Err(Error::Request(e));
                 }
-                continue;
-            }
-            let mut put = req.take_put();
-            match put.cf.as_str() {
-                "write" => {
-                    let mut row = EventRow::default();
-                    let skip = decode_write(put.take_key(), put.get_value(), &mut row);
-                    if skip {
-                        continue;
-                    }
-
-                    // In order to advance resolved ts,
-                    // we must untrack inflight txns if they are committed.
-                    let commit_ts = if row.commit_ts == 0 {
-                        None
-                    } else {
-                        Some(row.commit_ts)
-                    };
-                    match self.resolver {
-                        Some(ref mut resolver) => resolver.untrack_lock(
-                            row.start_ts.into(),
-                            commit_ts.map(Into::into),
-                            row.key.clone(),
-                        ),
-                        None => {
-                            assert!(self.pending.is_some(), "region resolver not ready");
-                            let pending = self.pending.as_mut().unwrap();
-                            pending.locks.push(PendingLock::Untrack {
-                                key: row.key.clone(),
-                                start_ts: row.start_ts.into(),
-                                commit_ts: commit_ts.map(Into::into),
-                            });
-                            pending.pending_bytes += row.key.len();
-                            CDC_PENDING_BYTES_GAUGE.add(row.key.len() as i64);
-                        }
-                    }
-
-                    let r = rows.insert(row.key.clone(), row);
-                    assert!(r.is_none());
-                }
-                "lock" => {
-                    let mut row = EventRow::default();
-                    let skip = decode_lock(put.take_key(), put.get_value(), &mut row);
-                    if skip {
-                        continue;
-                    }
-
-                    if self.txn_extra_op == TxnExtraOp::ReadOldValue {
-                        let key = Key::from_raw(&row.key).append_ts(row.start_ts.into());
-                        let start = Instant::now();
-
-                        let mut statistics = Statistics::default();
-                        row.old_value =
-                            old_value_cb.borrow_mut()(key, old_value_cache, &mut statistics)
-                                .unwrap_or_default();
-                        CDC_OLD_VALUE_DURATION_HISTOGRAM
-                            .with_label_values(&["all"])
-                            .observe(start.elapsed().as_secs_f64());
-                        for (cf, cf_details) in statistics.details().iter() {
-                            for (tag, count) in cf_details.iter() {
-                                CDC_OLD_VALUE_SCAN_DETAILS
-                                    .with_label_values(&[*cf, *tag])
-                                    .inc_by(*count as i64);
-                            }
-                        }
-                    }
-
-                    let occupied = rows.entry(row.key.clone()).or_default();
-                    if !occupied.value.is_empty() {
-                        assert!(row.value.is_empty());
-                        let mut value = vec![];
-                        mem::swap(&mut occupied.value, &mut value);
-                        row.value = value;
-                    }
-
-                    // In order to compute resolved ts,
-                    // we must track inflight txns.
-                    match self.resolver {
-                        Some(ref mut resolver) => {
-                            resolver.track_lock(row.start_ts.into(), row.key.clone())
-                        }
-                        None => {
-                            assert!(self.pending.is_some(), "region resolver not ready");
-                            let pending = self.pending.as_mut().unwrap();
-                            pending.locks.push(PendingLock::Track {
-                                key: row.key.clone(),
-                                start_ts: row.start_ts.into(),
-                            });
-                            pending.pending_bytes += row.key.len();
-                            CDC_PENDING_BYTES_GAUGE.add(row.key.len() as i64);
-                        }
-                    }
-
-                    *occupied = row;
-                }
-                "" | "default" => {
-                    let key = Key::from_encoded(put.take_key()).truncate_ts().unwrap();
-                    let row = rows.entry(key.into_raw().unwrap()).or_default();
-                    decode_default(put.take_value(), row);
-                }
-                other => {
-                    panic!("invalid cf {}", other);
+                ChangeLog::Rows { index, rows } => {
+                    let event_rows: Vec<_> = rows
+                        .into_iter()
+                        .map(|r| {
+                            decode_change_row(r).and_then(|(mut row, for_update_ts)| {
+                                if let Some(for_update_ts) = for_update_ts {
+                                    if self.txn_extra_op == TxnExtraOp::ReadOldValue {
+                                        row.old_value = read_old_value(
+                                            &row.key,
+                                            row.start_ts.into(),
+                                            for_update_ts,
+                                            &mut reader,
+                                            &mut old_value_cache,
+                                        )
+                                        .unwrap_or_default();
+                                    }
+                                }
+                                Some(row)
+                            })
+                        })
+                        .filter_map(|v| v)
+                        .collect();
+                    let mut event_entries = EventEntries::default();
+                    event_entries.entries = event_rows.into();
+                    self.broadcast_entries(index, event_entries);
                 }
             }
         }
-        let mut entries = Vec::with_capacity(rows.len());
-        for (_, v) in rows {
-            entries.push(v);
-        }
-        let mut event_entries = EventEntries::default();
-        event_entries.entries = entries.into();
-        let mut change_data_event = Event::default();
-        change_data_event.region_id = self.region_id;
-        change_data_event.index = index;
-        change_data_event.event = Some(Event_oneof_event::Entries(event_entries));
-        self.broadcast(change_data_event, true);
         Ok(())
     }
+}
 
-    fn sink_admin(&mut self, request: AdminRequest, mut response: AdminResponse) -> Result<()> {
-        let store_err = match request.get_cmd_type() {
-            AdminCmdType::Split => RaftStoreError::EpochNotMatch(
-                "split".to_owned(),
-                vec![
-                    response.mut_split().take_left(),
-                    response.mut_split().take_right(),
-                ],
-            ),
-            AdminCmdType::BatchSplit => RaftStoreError::EpochNotMatch(
-                "batchsplit".to_owned(),
-                response.mut_splits().take_regions().into(),
-            ),
-            AdminCmdType::PrepareMerge
-            | AdminCmdType::CommitMerge
-            | AdminCmdType::RollbackMerge => {
-                RaftStoreError::EpochNotMatch("merge".to_owned(), vec![])
+fn decode_change_row(r: ChangeRow) -> Option<(EventRow, Option<TimeStamp>)> {
+    match r {
+        ChangeRow::Prewrite { key, lock, value } => {
+            let mut row = EventRow::default();
+            row.start_ts = lock.ts.into_inner();
+            row.key = key.into_raw().unwrap();
+            row.op_type = match lock.lock_type {
+                LockType::Put => EventRowOpType::Put,
+                LockType::Delete => EventRowOpType::Delete,
+                _ => return None,
+            };
+            let for_update_ts = lock.for_update_ts;
+            if let Some(value) = lock.short_value {
+                row.value = value;
+            } else if let Some(value) = value {
+                row.value = value;
             }
-            _ => return Ok(()),
-        };
-        self.mark_failed();
-        Err(Error::Request(store_err.into()))
+            set_event_row_type(&mut row, EventLogType::Prewrite);
+            Some((row, Some(for_update_ts)))
+        }
+        ChangeRow::Commit {
+            key,
+            write,
+            commit_ts,
+        } => {
+            let mut row = EventRow::default();
+            if write.gc_fence.is_some() {
+                return None;
+            }
+            let (op_type, r_type) = match write.write_type {
+                WriteType::Put => (EventRowOpType::Put, EventLogType::Commit),
+                WriteType::Delete => (EventRowOpType::Delete, EventLogType::Commit),
+                WriteType::Rollback => (EventRowOpType::Unknown, EventLogType::Rollback),
+                _ => return None,
+            };
+            row.start_ts = write.start_ts.into_inner();
+            row.commit_ts = commit_ts.unwrap_or_else(TimeStamp::zero).into_inner();
+            row.key = key.into_raw().unwrap();
+            row.op_type = op_type;
+            set_event_row_type(&mut row, r_type);
+            Some((row, None))
+        }
     }
 }
 
@@ -719,65 +468,55 @@ fn set_event_row_type(row: &mut EventRow, ty: EventLogType) {
     }
 }
 
-fn decode_write(key: Vec<u8>, value: &[u8], row: &mut EventRow) -> bool {
-    let write = WriteRef::parse(value).unwrap().to_owned();
-    let (op_type, r_type) = match write.write_type {
-        WriteType::Put => (EventRowOpType::Put, EventLogType::Commit),
-        WriteType::Delete => (EventRowOpType::Delete, EventLogType::Commit),
-        WriteType::Rollback => (EventRowOpType::Unknown, EventLogType::Rollback),
-        other => {
-            debug!("skip write record"; "write" => ?other, "key" => hex::encode_upper(key));
-            return true;
+fn read_old_value<S: EngineSnapshot>(
+    key: &[u8],
+    start_ts: TimeStamp,
+    for_update_ts: TimeStamp,
+    reader: &mut OldValueReader<S>,
+    old_value_cache: &mut OldValueCache,
+) -> Option<Value> {
+    let start = Instant::now();
+    let mut statistics = Statistics::default();
+    let key = Key::from_raw(key).append_ts(start_ts);
+    old_value_cache.access_count += 1;
+    if let Some((old_value, mutation_type)) = old_value_cache.cache.remove(&key) {
+        match mutation_type {
+            MutationType::Insert => {
+                assert!(old_value.is_none());
+                return None;
+            }
+            MutationType::Put | MutationType::Delete => {
+                if let Some(old_value) = old_value {
+                    let start_ts = old_value.start_ts;
+                    return old_value.short_value.or_else(|| {
+                        let prev_key = key.truncate_ts().unwrap().append_ts(start_ts);
+                        let start = Instant::now();
+                        let value = reader.get_value_default(&prev_key, &mut statistics);
+                        CDC_OLD_VALUE_DURATION_HISTOGRAM
+                            .with_label_values(&["get"])
+                            .observe(start.elapsed().as_secs_f64());
+                        value
+                    });
+                }
+            }
+            _ => unreachable!(),
         }
-    };
-    let key = Key::from_encoded(key);
-    let commit_ts = if write.write_type == WriteType::Rollback {
-        0
-    } else {
-        key.decode_ts().unwrap().into_inner()
-    };
-    row.start_ts = write.start_ts.into_inner();
-    row.commit_ts = commit_ts;
-    row.key = key.truncate_ts().unwrap().into_raw().unwrap();
-    row.op_type = op_type;
-    set_event_row_type(row, r_type);
-    if let Some(value) = write.short_value {
-        row.value = value;
     }
-
-    false
-}
-
-fn decode_lock(key: Vec<u8>, value: &[u8], row: &mut EventRow) -> bool {
-    let lock = Lock::parse(value).unwrap();
-    let op_type = match lock.lock_type {
-        LockType::Put => EventRowOpType::Put,
-        LockType::Delete => EventRowOpType::Delete,
-        other => {
-            debug!("skip lock record";
-                "type" => ?other,
-                "start_ts" => ?lock.ts,
-                "key" => hex::encode_upper(key),
-                "for_update_ts" => ?lock.for_update_ts);
-            return true;
-        }
-    };
-    let key = Key::from_encoded(key);
-    row.start_ts = lock.ts.into_inner();
-    row.key = key.into_raw().unwrap();
-    row.op_type = op_type;
-    set_event_row_type(row, EventLogType::Prewrite);
-    if let Some(value) = lock.short_value {
-        row.value = value;
-    }
-
-    false
-}
-
-fn decode_default(value: Vec<u8>, row: &mut EventRow) {
-    if !value.is_empty() {
-        row.value = value.to_vec();
-    }
+    // Cannot get old value from cache, seek for it in engine.
+    old_value_cache.miss_count += 1;
+    let start = Instant::now();
+    let query_ts = std::cmp::max(start_ts, for_update_ts);
+    let key = key.truncate_ts().unwrap().append_ts(query_ts);
+    let value = reader
+        .near_seek_old_value(&key, &mut statistics)
+        .unwrap_or_default();
+    CDC_OLD_VALUE_DURATION_HISTOGRAM
+        .with_label_values(&["seek"])
+        .observe(start.elapsed().as_secs_f64());
+    CDC_OLD_VALUE_DURATION_HISTOGRAM
+        .with_label_values(&["all"])
+        .observe(start.elapsed().as_secs_f64());
+    value
 }
 
 #[cfg(test)]

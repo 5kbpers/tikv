@@ -1,24 +1,18 @@
-use engine_traits::{KvEngine, Snapshot};
-use raftstore::store::fsm::{ChangeCmd, ChangeObserve, ObserveID, ObserveRange, StoreMeta};
+use engine_traits::Snapshot;
+use raftstore::store::fsm::ObserveId;
 use raftstore::store::RegionSnapshot;
+use txn_types::TimeStamp;
 
 use crate::cmd::ChangeLog;
 
-pub enum SinkCmd {
-    // region id -> resolved ts
-    ResolvedTs(Vec<(u64, u64)>),
-    // region error
-    Error(),
-    // ChangeLog
-    ChangeLog {
-        region_id: u64,
-        observe_id: ObserveID,
-        logs: Vec<ChangeLog>,
-    },
+pub struct SinkCmd {
+    pub region_id: u64,
+    pub observe_id: ObserveId,
+    pub logs: Vec<ChangeLog>,
 }
 
 pub trait CmdSinker<S: Snapshot>: Send {
-    fn sink_cmd(&mut self, cmd: Vec<SinkCmd>, snapshot: RegionSnapshot<S>);
+    fn sink_cmd(&mut self, sink_cmd: Vec<SinkCmd>, snapshot: RegionSnapshot<S>);
 
-    fn sink_resolved_ts(&mut self);
+    fn sink_resolved_ts(&mut self, regions: Vec<u64>, ts: TimeStamp);
 }

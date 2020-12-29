@@ -2,22 +2,27 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use engine_traits::KvEngine;
+use kvproto::errorpb;
 use kvproto::kvrpcpb::{ExtraOp as TxnExtraOp, IsolationLevel};
 use kvproto::metapb::Region;
+use kvproto::raft_cmdpb::RaftCmdResponse;
 use raftstore::router::RaftStoreRouter;
-use raftstore::store::fsm::{ChangeCmd, ChangeObserve, ObserveID, ObserveRange};
+use raftstore::store::fsm::{ChangeCmd, ChangeObserve, ObserveId, ObserveRange};
 use raftstore::store::msg::{Callback, SignificantMsg};
 use raftstore::store::RegionSnapshot;
 use tikv::storage::kv::{ScanMode as MvccScanMode, Snapshot};
 use tikv::storage::mvcc::{DeltaScanner, MvccReader, ScannerBuilder};
 use tikv::storage::txn::{TxnEntry, TxnEntryScanner};
 use tokio::runtime::{Builder, Runtime};
-use txn_types::{Key, Lock, TimeStamp};
+use txn_types::{Key, Lock, LockType, TimeStamp, Value, WriteType};
 
+use crate::cmd::{decode_lock, decode_write, ChangeRow};
 use crate::endpoint::Task;
 use crate::errors::{Error, Result};
 
 const DEFAULT_SCAN_BATCH_SIZE: usize = 1024;
+
+type OldValue = Option<Value>;
 
 pub enum ScanMode {
     LockOnly,
@@ -26,20 +31,20 @@ pub enum ScanMode {
 }
 
 pub struct ScanTask {
-    pub id: ObserveID,
+    pub id: usize,
     pub tag: String,
     pub mode: ScanMode,
     pub region: Region,
     pub checkpoint_ts: TimeStamp,
     pub cancelled: Box<dyn Fn() -> bool + Send>,
-    pub send_entries: Box<dyn Fn(Vec<ScanEntry>) + Send>,
-    pub before_start: Option<Box<dyn Fn() + Send>>,
-    pub on_error: Option<Box<dyn Fn(ObserveID, Region, Error) + Send>>,
+    pub send_entries: Box<dyn Fn(ScanEntry) + Send>,
+    pub before_start: Option<Box<dyn Fn(&RaftCmdResponse) + Send>>,
+    pub on_error: Option<Box<dyn Fn(Region, Error) + Send>>,
 }
 
 #[derive(Debug)]
 pub enum ScanEntry {
-    TxnEntry(Vec<TxnEntry>),
+    TxnEntry(Vec<(ChangeRow, OldValue)>),
     Lock(Vec<(Key, Lock)>),
     None,
 }
@@ -82,12 +87,11 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> ScannerPool<T, E> {
                         ..
                     } = task;
                     if let Some(on_error) = on_error {
-                        on_error(id, region, e);
+                        on_error(region, e);
                     }
                     return;
                 }
             };
-            let mut entries = vec![];
             match task.mode {
                 ScanMode::All | ScanMode::AllWithOldValue => {
                     let txn_extra_op = if let ScanMode::AllWithOldValue = task.mode {
@@ -112,13 +116,13 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> ScannerPool<T, E> {
                                     ..
                                 } = task;
                                 if let Some(on_error) = on_error {
-                                    on_error(id, region, e);
+                                    on_error(region, e);
                                 }
                                 return;
                             }
                         };
                         done = !has_remaining;
-                        entries.push(ScanEntry::TxnEntry(es));
+                        (task.send_entries)(ScanEntry::TxnEntry(es));
                     }
                 }
                 ScanMode::LockOnly => {
@@ -144,7 +148,7 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> ScannerPool<T, E> {
                                         ..
                                     } = task;
                                     if let Some(on_error) = on_error {
-                                        on_error(id, region, e);
+                                        on_error(region, e);
                                     }
                                     return;
                                 }
@@ -153,12 +157,11 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> ScannerPool<T, E> {
                         if has_remaining {
                             start = Some(locks.last().unwrap().0.clone())
                         }
-                        entries.push(ScanEntry::Lock(locks));
+                        (task.send_entries)(ScanEntry::Lock(locks));
                     }
                 }
             }
-            entries.push(ScanEntry::None);
-            (task.send_entries)(entries);
+            (task.send_entries)(ScanEntry::None);
         };
         self.workers.spawn(fut);
     }
@@ -171,10 +174,10 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> ScannerPool<T, E> {
         let before_start = task.before_start.take();
         let change_cmd = ChangeCmd {
             region_id: task.region.id,
-            change_observe: ChangeObserve {
-                id: task.id,
+            change_observe: Some(ChangeObserve {
+                id: task.id.into(),
                 range: ObserveRange::All,
-            },
+            }),
         };
         raft_router.significant_send(
             task.region.id,
@@ -183,7 +186,7 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> ScannerPool<T, E> {
                 region_epoch: task.region.get_region_epoch().clone(),
                 callback: Callback::Read(Box::new(move |resp| {
                     if let Some(f) = before_start {
-                        f();
+                        f(&resp.response);
                     }
                     cb(resp)
                 })),
@@ -206,20 +209,63 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> ScannerPool<T, E> {
         Ok((locks, has_remaining))
     }
 
-    fn scan_delta<S: Snapshot>(scanner: &mut DeltaScanner<S>) -> Result<(Vec<TxnEntry>, bool)> {
-        let mut entries = Vec::with_capacity(DEFAULT_SCAN_BATCH_SIZE);
+    fn scan_delta<S: Snapshot>(
+        scanner: &mut DeltaScanner<S>,
+    ) -> Result<(Vec<(ChangeRow, OldValue)>, bool)> {
+        let mut rows = Vec::with_capacity(DEFAULT_SCAN_BATCH_SIZE);
         let mut has_remaining = true;
-        while entries.len() < entries.capacity() {
+        while rows.len() < rows.capacity() {
             match scanner.next_entry()? {
-                Some(entry) => {
-                    entries.push(entry);
-                }
+                Some(entry) => match entry {
+                    TxnEntry::Prewrite {
+                        default,
+                        lock,
+                        old_value,
+                    } => {
+                        if let Some(l) = decode_lock(&lock.0, &lock.1) {
+                            let value = if default.1.is_empty() {
+                                None
+                            } else {
+                                Some(default.1)
+                            };
+                            rows.push((
+                                ChangeRow::Prewrite {
+                                    key: Key::from_encoded(lock.0),
+                                    lock: l,
+                                    value,
+                                },
+                                old_value,
+                            ))
+                        }
+                    }
+                    TxnEntry::Commit {
+                        default,
+                        write,
+                        old_value,
+                    } => {
+                        if let Some(w) = decode_write(&write.0, &write.1) {
+                            let commit_ts = if w.write_type == WriteType::Rollback {
+                                None
+                            } else {
+                                Some(Key::decode_ts_from(&write.0).unwrap())
+                            };
+                            rows.push((
+                                ChangeRow::Commit {
+                                    key: Key::from_encoded(write.0),
+                                    write: w,
+                                    commit_ts,
+                                },
+                                old_value,
+                            ))
+                        }
+                    }
+                },
                 None => {
                     has_remaining = false;
                     break;
                 }
             }
         }
-        Ok((entries, has_remaining))
+        Ok((rows, has_remaining))
     }
 }

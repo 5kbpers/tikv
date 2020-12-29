@@ -7,7 +7,7 @@ use engine_traits::KvEngine;
 use kvproto::metapb::{Peer, Region};
 use raft::StateRole;
 use raftstore::coprocessor::*;
-use raftstore::store::fsm::ObserveID;
+use raftstore::store::fsm::ObserveId;
 use raftstore::store::RegionSnapshot;
 use tikv_util::worker::Scheduler;
 
@@ -30,13 +30,13 @@ impl<E: KvEngine> ChangeDataObserver<E> {
 impl<E: KvEngine> Coprocessor for ChangeDataObserver<E> {}
 
 impl<E: KvEngine> CmdObserver<E> for ChangeDataObserver<E> {
-    fn on_prepare_for_apply(&self, observe_id: ObserveID, region_id: u64) {
+    fn on_prepare_for_apply(&self, observe_id: ObserveId, region_id: u64) {
         self.cmd_batches
             .borrow_mut()
             .push(CmdBatch::new(observe_id, region_id));
     }
 
-    fn on_apply_cmd(&self, observe_id: ObserveID, region_id: u64, cmd: Cmd) {
+    fn on_apply_cmd(&self, observe_id: ObserveId, region_id: u64, cmd: Cmd) {
         self.cmd_batches
             .borrow_mut()
             .last_mut()
