@@ -765,11 +765,25 @@ impl<ER: RaftEngine> Debugger<ER> {
     }
 
     pub fn get_range_properties(&self, start: &[u8], end: &[u8]) -> Result<Vec<(String, String)>> {
-        dump_mvcc_properties(
-            self.engines.kv.as_inner(),
-            &keys::data_key(start),
-            &keys::data_end_key(end),
-        )
+        let start = keys::data_key(start);
+        let end = keys::data_key(end);
+        let kv_engine = &self.engines.kv;
+        let range = Range {
+            start_key: &start,
+            end_key: &end,
+        };
+        let size = kv_engine.get_range_approximate_size(range, 0, 0).unwrap();
+        let keys = kv_engine.get_range_approximate_keys(range, 0, 0).unwrap();
+        let mut props: Vec<(String, String)> = [("size", size), ("keys", keys)]
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        props.append(&mut dump_mvcc_properties(
+            kv_engine.as_inner(),
+            &start,
+            &end,
+        )?);
+        Ok(props)
     }
 }
 
