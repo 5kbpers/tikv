@@ -498,4 +498,32 @@ lazy_static! {
         ).unwrap();
     pub static ref COMPACTION_GUARD_ACTION_COUNTER: CompactionGuardActionVec =
         auto_flush_from!(COMPACTION_GUARD_ACTION_COUNTER_VEC, CompactionGuardActionVec);
+
+    // Observe apply leader proposal.
+    pub static ref APPLY_PROPOSAL_WAIT_TIME_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_apply_proposal_wait_time_duration_secs",
+            "Bucketed histogram of apply proposal wait time duration.",
+            exponential_buckets(0.0005, 2.0, 20).unwrap()
+        ).unwrap();
+    pub static ref APPLY_PROPOSAL_COUNT_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_apply_proposal_count",
+            "Bucketed histogram of apply proposal count.",
+            exponential_buckets(1.0, 2.0, 20).unwrap()
+        ).unwrap();
+
+    // Observe apply follower messages.
+    pub static ref APPLY_MESSAGE_WAIT_TIME_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_apply_message_wait_time_duration_secs",
+            "Bucketed histogram of apply message wait time duration.",
+            exponential_buckets(0.0005, 2.0, 20).unwrap()
+        ).unwrap();
+    pub static ref APPLY_MESSAGE_COUNT_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_apply_message_count",
+            "Bucketed histogram of apply message count.",
+            exponential_buckets(1.0, 2.0, 20).unwrap()
+        ).unwrap();
 }

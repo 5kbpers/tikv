@@ -28,7 +28,7 @@ enum CheckDoResult<T> {
 /// missing fsm for specified address. Normal fsm and control fsm can have
 /// different scheduler, but this is not required.
 pub struct Router<N: Fsm, C: Fsm, Ns, Cs> {
-    normals: Arc<Mutex<HashMap<u64, BasicMailbox<N>>>>,
+    pub normals: Arc<Mutex<HashMap<u64, BasicMailbox<N>>>>,
     caches: Cell<LruCache<u64, BasicMailbox<N>>>,
     pub(super) control_box: BasicMailbox<C>,
     // TODO: These two schedulers should be unified as single one. However

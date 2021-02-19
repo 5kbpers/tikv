@@ -59,6 +59,7 @@ use crate::store::metrics::*;
 use crate::store::peer_storage::{self, HandleRaftReadyContext};
 use crate::store::transport::Transport;
 use crate::store::util::is_initial_msg;
+use crate::store::worker::MetricObserverRunner;
 use crate::store::worker::{
     AutoSplitController, CleanupRunner, CleanupSSTRunner, CleanupSSTTask, CleanupTask,
     CompactRunner, CompactTask, ConsistencyCheckRunner, ConsistencyCheckTask, PdRunner,
@@ -1201,6 +1202,12 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         let consistency_check_scheduler = workers
             .background_worker
             .start("consistency-check", consistency_check_runner);
+
+        let metric_observer_runner =
+            MetricObserverRunner::new(self.router.clone(), self.apply_router.clone());
+        workers
+            .background_worker
+            .start_with_timer("metric_observer", metric_observer_runner);
 
         let mut builder = RaftPollerBuilder {
             cfg,

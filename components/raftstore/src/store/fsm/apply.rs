@@ -3349,7 +3349,7 @@ where
             match drainer.next() {
                 Some(Msg::Apply { start, apply }) => {
                     if channel_timer.is_none() {
-                        channel_timer = Some(start);
+                        channel_timer = Some((start, !apply.cbs.is_empty(), apply.entries_count));
                     }
                     self.handle_apply(apply_ctx, apply);
                     if let Some(ref mut state) = self.delegate.yield_state {
@@ -3375,9 +3375,16 @@ where
                 None => break,
             }
         }
-        if let Some(timer) = channel_timer {
+        if let Some((timer, has_proposal, entries_count)) = channel_timer {
             let elapsed = duration_to_sec(timer.elapsed());
             APPLY_TASK_WAIT_TIME_HISTOGRAM.observe(elapsed);
+            if has_proposal {
+                APPLY_PROPOSAL_WAIT_TIME_HISTOGRAM.observe(elapsed);
+                APPLY_PROPOSAL_COUNT_HISTOGRAM.observe(entries_count as f64);
+            } else {
+                APPLY_MESSAGE_WAIT_TIME_HISTOGRAM.observe(elapsed);
+                APPLY_MESSAGE_COUNT_HISTOGRAM.observe(entries_count as f64);
+            }
         }
     }
 }
