@@ -7,12 +7,13 @@ extern crate test;
 use batch_system::test_runner::*;
 use batch_system::*;
 use criterion::*;
+use hdrhistogram::Histogram;
 use std::sync::atomic::*;
 use std::sync::Arc;
 
 fn end_hook(tx: &std::sync::mpsc::Sender<()>) -> Message {
     let tx = tx.clone();
-    Message::Callback(Box::new(move |_| {
+    Message::Callback(Box::new(move || {
         tx.send(()).unwrap();
     }))
 }

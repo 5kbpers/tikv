@@ -10,6 +10,9 @@ use std::sync::{Arc, Mutex};
 use tikv_util::lru::LruCache;
 use tikv_util::Either;
 
+const SHARD_BITS: usize = 2;
+const SHARD_NUM: usize = 1 << SHARD_BITS;
+
 enum CheckDoResult<T> {
     NotExist,
     Invalid,

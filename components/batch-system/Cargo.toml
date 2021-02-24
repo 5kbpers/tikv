@@ -26,6 +26,7 @@ derive_more = { version = "0.99", optional = true }
 
 [dev-dependencies]
 criterion = "0.3"
+hdrhistogram = "6.0"
 
 [[test]]
 name = "tests"

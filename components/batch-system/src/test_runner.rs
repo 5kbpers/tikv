@@ -3,16 +3,21 @@
 //! A sample Handler for test and micro-benchmark purpose.
 
 use crate::*;
+use hdrhistogram::Histogram;
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 use tikv_util::mpsc;
+
+type Callback = Box<dyn FnOnce() + Send + 'static>;
 
 /// Message `Runner` can accepts.
 pub enum Message {
     /// `Runner` will do simple calculation for the given times.
     Loop(usize),
     /// `Runner` will call the callback directly.
-    Callback(Box<dyn FnOnce(&mut Runner) + Send + 'static>),
+    Callback(Callback),
+    /// Similar with `Loop`, call the callback in `end`.
+    LoopCallback((usize, Callback)),
 }
 
 /// A simple runner used for benchmarking only.
@@ -56,16 +61,29 @@ impl Runner {
     }
 }
 
-#[derive(Add, PartialEq, Debug, Default, AddAssign, Clone, Copy)]
+#[derive(PartialEq, Debug, AddAssign, Clone)]
 pub struct HandleMetrics {
     pub begin: usize,
     pub control: usize,
     pub normal: usize,
+    pub lat_ns_histogram: Histogram<u64>,
+}
+
+impl Default for HandleMetrics {
+    fn default() -> Self {
+        Self {
+            begin: 0,
+            control: 0,
+            normal: 0,
+            lat_ns_histogram: Histogram::new_with_bounds(0, 1_000_000_000, 2).unwrap(),
+        }
+    }
 }
 
 pub struct Handler {
     local: HandleMetrics,
     metrics: Arc<Mutex<HandleMetrics>>,
+    pending_cbs: Vec<Callback>,
 }
 
 impl Handler {
@@ -79,7 +97,14 @@ impl Handler {
                         r.res %= count + 1;
                     }
                 }
-                Ok(Message::Callback(cb)) => cb(r),
+                Ok(Message::Callback(cb)) => cb(),
+                Ok(Message::LoopCallback((count, cb))) => {
+                    for _ in 0..count {
+                        r.res *= count;
+                        r.res %= count + 1;
+                    }
+                    self.pending_cbs.push(cb);
+                }
                 Err(_) => break,
             }
         }
@@ -106,6 +131,10 @@ impl PollHandler<Runner, Runner> for Handler {
         let mut c = self.metrics.lock().unwrap();
         *c += self.local;
         self.local = HandleMetrics::default();
+        let cbs = std::mem::take(&mut self.pending_cbs);
+        for cb in cbs {
+            cb();
+        }
     }
 }
 
@@ -128,6 +157,7 @@ impl HandlerBuilder<Runner, Runner> for Builder {
         Handler {
             local: HandleMetrics::default(),
             metrics: self.metrics.clone(),
+            pending_cbs: Vec::default(),
         }
     }
 }
