@@ -1,11 +1,9 @@
 [package]
-name = "batch-system"
+name = "hash-system"
 version = "0.1.0"
 edition = "2018"
 
 [features]
-default = ["test-runner", "protobuf-codec"]
-test-runner = ["derive_more"]
 protobuf-codec = [
   "tikv_util/protobuf-codec",
 ]
@@ -23,24 +21,4 @@ serde_derive = "1.0"
 slog = { version = "2.3", features = ["max_level_trace", "release_max_level_debug"] }
 slog-global = { version = "0.1", git = "https://github.com/breeswish/slog-global.git", rev = "d592f88e4dbba5eb439998463054f1a44fbf17b9" }
 derive_more = { version = "0.99", optional = true }
-hdrhistogram = "6.0"
-
-[dev-dependencies]
-criterion = "0.3"
-
-[[test]]
-name = "tests"
-path = "tests/cases/mod.rs"
-required-features = ["test-runner"]
-
-[[bench]]
-name = "router"
-path = "benches/router.rs"
-harness = false
-required-features = ["test-runner"]
-
-[[bench]]
-name = "batch-system"
-path = "benches/batch-system.rs"
-harness = false
-required-features = ["test-runner"]
+batch-system = { path = "../batch-system", default-features = false }

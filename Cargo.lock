@@ -1746,6 +1746,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hash-system"
+version = "0.1.0"
+dependencies = [
+ "batch-system",
+ "collections",
+ "crossbeam",
+ "derive_more",
+ "file_system",
+ "serde",
+ "serde_derive",
+ "slog",
+ "slog-global",
+ "tikv_util",
+]
+
+[[package]]
 name = "hdrhistogram"
 version = "6.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4916,6 +4932,7 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "grpcio",
+ "hash-system",
  "hex 0.4.2",
  "http",
  "hyper",

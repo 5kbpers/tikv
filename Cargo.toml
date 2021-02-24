@@ -26,6 +26,7 @@ failpoints = [
 ]
 protobuf-codec = [
   "batch-system/protobuf-codec",
+  "hash-system/protobuf-codec",
   "codec/protobuf-codec",
   "concurrency_manager/protobuf-codec",
   "encryption/protobuf-codec",
@@ -55,6 +56,7 @@ protobuf-codec = [
 ]
 prost-codec = [
   "batch-system/prost-codec",
+  "hash-system/prost-codec",
   "codec/prost-codec",
   "concurrency_manager/prost-codec",
   "encryption/prost-codec",
@@ -105,6 +107,7 @@ async-stream = "0.2"
 async-trait = "0.1"
 backtrace = "0.3"
 batch-system = { path = "components/batch-system", default-features = false }
+hash-system = { path = "components/hash-system", default-features = false }
 bitflags = "1.0.1"
 byteorder = "1.2"
 chrono = "0.4"
@@ -256,6 +259,7 @@ members = [
   "components/txn_types",
   "components/resolved_ts",
   "components/batch-system",
+  "components/hash-system",
   "components/cdc",
   "components/raftstore",
   "components/into_other",
