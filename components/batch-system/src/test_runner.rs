@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 use tikv_util::mpsc;
 
-type Callback = Box<dyn FnOnce() + Send + 'static>;
+type Callback = Box<dyn FnOnce(&mut Runner) + Send + 'static>;
 
 /// Message `Runner` can accepts.
 pub enum Message {
@@ -97,7 +97,7 @@ impl Handler {
                         r.res %= count + 1;
                     }
                 }
-                Ok(Message::Callback(cb)) => cb(),
+                Ok(Message::Callback(cb)) => cb(r),
                 Ok(Message::LoopCallback((count, cb))) => {
                     for _ in 0..count {
                         r.res *= count;
@@ -128,12 +128,12 @@ impl PollHandler<Runner, Runner> for Handler {
     }
 
     fn end(&mut self, _normals: &mut [Box<Runner>]) {
-        let mut c = self.metrics.lock().unwrap();
-        *c += self.local;
+        // let mut c = self.metrics.lock().unwrap();
+        // *c += self.local;
         self.local = HandleMetrics::default();
         let cbs = std::mem::take(&mut self.pending_cbs);
         for cb in cbs {
-            cb();
+            // cb();
         }
     }
 }

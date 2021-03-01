@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 fn end_hook(tx: &std::sync::mpsc::Sender<()>) -> Message {
     let tx = tx.clone();
-    Message::Callback(Box::new(move || {
+    Message::Callback(Box::new(move |_| {
         tx.send(()).unwrap();
     }))
 }

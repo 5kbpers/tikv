@@ -1754,6 +1754,7 @@ dependencies = [
  "crossbeam",
  "derive_more",
  "file_system",
+ "fxhash",
  "serde",
  "serde_derive",
  "slog",

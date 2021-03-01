@@ -22,3 +22,4 @@ slog = { version = "2.3", features = ["max_level_trace", "release_max_level_debu
 slog-global = { version = "0.1", git = "https://github.com/breeswish/slog-global.git", rev = "d592f88e4dbba5eb439998463054f1a44fbf17b9" }
 derive_more = { version = "0.99", optional = true }
 batch-system = { path = "../batch-system", default-features = false }
+fxhash = "0.2.1"
