@@ -36,7 +36,7 @@ impl<N: Fsm, C: Fsm> Router<N, C> {
     }
 
     /// Register a mailbox with given address.
-    pub fn register(&self, addr: u64, fsm: N) {
+    pub fn register(&self, addr: u64, fsm: Box<N>) {
         let mut normals = self.normals.lock().unwrap();
         let caches = unsafe { &mut *self.caches.as_ptr() };
         normals.insert(addr);
@@ -50,7 +50,7 @@ impl<N: Fsm, C: Fsm> Router<N, C> {
         }
     }
 
-    pub fn register_all(&self, addrs: Vec<(u64, N)>) {
+    pub fn register_all(&self, addrs: Vec<(u64, Box<N>)>) {
         let mut normals = self.normals.lock().unwrap();
         let caches = unsafe { &mut *self.caches.as_ptr() };
         normals.reserve(addrs.len());

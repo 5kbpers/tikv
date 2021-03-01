@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
 use batch_system::{Config, Fsm};
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use crossbeam::channel::{self, Receiver, Sender};
 use file_system::{set_io_type, IOType};
 
@@ -12,22 +12,23 @@ pub trait PollHandler<N: Fsm, C: Fsm> {
     fn begin(&mut self);
     fn handle_normal_msg(&mut self, fsm: &mut N, msg: N::Message);
     fn handle_control_msg(&mut self, fsm: &mut C, msg: C::Message);
-    fn end(&mut self, normals: &mut Vec<(u64, N)>);
+    fn end(&mut self, normals: &mut [Box<N>]);
+    fn pause(&mut self) {}
 }
 
 pub enum Message<N: Fsm, C: Fsm> {
     ControlMsg(C::Message),
     NormalMsg((u64, N::Message)),
-    RegisterNormal((u64, N)),
-    RegisterControl(C),
+    RegisterNormal((u64, Box<N>)),
+    RegisterControl(Box<C>),
     CloseNormal(u64),
     Stop,
 }
 
 pub struct Poller<N: Fsm, C: Fsm, Handler> {
     router: Router<N, C>,
-    control: Option<C>,
-    normals: HashMap<u64, N>,
+    control: Option<Box<C>>,
+    normals: HashMap<u64, Box<N>>,
     handler: Handler,
     max_batch_size: usize,
     msg_receiver: Receiver<Message<N, C>>,
@@ -44,6 +45,7 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                 continue;
             }
             if batch.is_empty() {
+                self.handler.pause();
                 if let Ok(msg) = self.msg_receiver.recv() {
                     batch.push(msg);
                     continue;
@@ -57,9 +59,9 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
 
     pub fn poll(&mut self) {
         let mut batch = Vec::with_capacity(self.max_batch_size);
-        let mut handled_normals = Vec::with_capacity(self.max_batch_size);
 
         while !self.recv_batch(&mut batch) {
+            let mut handled_normals = HashSet::default();
             self.handler.begin();
             for msg in std::mem::take(&mut batch) {
                 match msg {
@@ -67,9 +69,9 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                         .handler
                         .handle_control_msg(self.control.as_mut().unwrap(), m),
                     Message::NormalMsg((addr, m)) => {
-                        if let Some(mut fsm) = self.normals.remove(&addr) {
-                            self.handler.handle_normal_msg(&mut fsm, m);
-                            handled_normals.push((addr, fsm));
+                        if let Some(fsm) = self.normals.get_mut(&addr) {
+                            self.handler.handle_normal_msg(fsm, m);
+                            handled_normals.insert(addr);
                         }
                     }
                     Message::RegisterNormal((addr, fsm)) => {
@@ -82,9 +84,14 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                     Message::Stop => break,
                 }
             }
-            self.handler.end(&mut handled_normals);
-            for (addr, fsm) in std::mem::take(&mut handled_normals) {
-                self.normals.insert(addr, fsm);
+            let addrs: Vec<_> = handled_normals.into_iter().collect();
+            let mut normals: Vec<_> = addrs
+                .iter()
+                .map(|addr| self.normals.remove(&addr).unwrap())
+                .collect();
+            self.handler.end(&mut normals);
+            for (i, fsm) in normals.into_iter().enumerate() {
+                self.normals.insert(addrs[i], fsm);
             }
         }
     }
@@ -110,7 +117,7 @@ pub struct System<N: Fsm, C: Fsm> {
     workers: Vec<JoinHandle<()>>,
     senders: Vec<Sender<Message<N, C>>>,
     receivers: Vec<Receiver<Message<N, C>>>,
-    control: Option<C>,
+    control: Option<Box<C>>,
 }
 
 impl<N, C> System<N, C>
@@ -182,7 +189,10 @@ where
 /// Create a batch system with the given thread name prefix and pool size.
 ///
 /// `sender` and `controller` should be paired.
-pub fn create_system<N: Fsm, C: Fsm>(cfg: &Config, control: C) -> (Router<N, C>, System<N, C>) {
+pub fn create_system<N: Fsm, C: Fsm>(
+    cfg: &Config,
+    control: Box<C>,
+) -> (Router<N, C>, System<N, C>) {
     let (senders, receivers): (Vec<_>, Vec<_>) =
         (0..cfg.pool_size).map(|_| channel::unbounded()).unzip();
     let router = Router::new(senders.clone());

@@ -3357,6 +3357,7 @@ dependencies = [
  "fs2",
  "futures 0.3.7",
  "futures-util",
+ "hash-system",
  "into_other",
  "keys",
  "kvproto",

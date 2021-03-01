@@ -70,22 +70,22 @@ where
     ER: RaftEngine,
 {
     fn on_timeout(&mut self) {
-        let store_normals;
-        let apply_normals;
-        {
-            let store_guard = self.store_router.router.normals.lock().unwrap();
-            store_normals = store_guard.clone();
-        }
-        {
-            let apply_guard = self.apply_router.router.normals.lock().unwrap();
-            apply_normals = apply_guard.clone();
-        }
-        for (_, mailbox) in store_normals {
-            STORE_QUEUE_LEN_HISTOGRAM.observe(mailbox.len() as f64);
-        }
-        for (_, mailbox) in apply_normals {
-            APPLY_QUEUE_LEN_HISTOGRAM.observe(mailbox.len() as f64);
-        }
+        // let store_normals;
+        // let apply_normals;
+        // {
+        //     let store_guard = self.store_router.router.normals.lock().unwrap();
+        //     store_normals = store_guard.clone();
+        // }
+        // {
+        //     let apply_guard = self.apply_router.router.normals.lock().unwrap();
+        //     apply_normals = apply_guard.clone();
+        // }
+        // for (_, mailbox) in store_normals {
+        //     STORE_QUEUE_LEN_HISTOGRAM.observe(mailbox.len() as f64);
+        // }
+        // for (_, mailbox) in apply_normals {
+        //     APPLY_QUEUE_LEN_HISTOGRAM.observe(mailbox.len() as f64);
+        // }
     }
     fn get_interval(&self) -> std::time::Duration {
         std::time::Duration::from_millis(METRICS_FLUSH_INTERVAL)

@@ -3191,15 +3191,18 @@ where
             .logs_up_to_date
             .store(region_id, Ordering::SeqCst);
         // To trigger the target apply fsm
-        if let Some(mailbox) = ctx.router.mailbox(catch_up_logs.target_region_id) {
-            let _ = mailbox.force_send(Msg::Noop);
-        } else {
-            error!(
-                "failed to get mailbox, are we shutting down?";
-                "region_id" => region_id,
-                "peer_id" => self.delegate.id(),
-            );
-        }
+        // if let Some(mailbox) = ctx.router.mailbox(catch_up_logs.target_region_id) {
+        //     let _ = mailbox.force_send(Msg::Noop);
+        // } else {
+        //     error!(
+        //         "failed to get mailbox, are we shutting down?";
+        //         "region_id" => region_id,
+        //         "peer_id" => self.delegate.id(),
+        //     );
+        // }
+        ctx.router
+            .force_send(catch_up_logs.target_region_id, Msg::Noop)
+            .unwrap();
     }
 
     #[allow(unused_mut)]
@@ -3450,12 +3453,12 @@ where
     cfg_tracker: Tracker<Config>,
 }
 
-impl<EK, W> PollHandler<ApplyFsm<EK>, ControlFsm> for ApplyPoller<EK, W>
+impl<EK, W> hash_system::PollHandler<ApplyFsm<EK>, ControlFsm> for ApplyPoller<EK, W>
 where
     EK: KvEngine,
     W: WriteBatch<EK>,
 {
-    fn begin(&mut self, _batch_size: usize) {
+    fn begin(&mut self) {
         if let Some(incoming) = self.cfg_tracker.any_new() {
             match Ord::cmp(&incoming.messages_per_tick, &self.messages_per_tick) {
                 CmpOrdering::Greater => {
@@ -3473,11 +3476,11 @@ where
     }
 
     /// There is no control fsm in apply poller.
-    fn handle_control(&mut self, _: &mut ControlFsm) -> Option<usize> {
+    fn handle_control_msg(&mut self, _: &mut ControlFsm, _: ControlMsg) {
         unimplemented!()
     }
 
-    fn handle_normal(&mut self, normal: &mut ApplyFsm<EK>) -> Option<usize> {
+    fn handle_normal_msg(&mut self, normal: &mut ApplyFsm<EK>, msg: Msg<EK>) {
         let mut expected_msg_count = None;
         normal.delegate.handle_start = Some(Instant::now_coarse());
         if normal.delegate.yield_state.is_some() {
@@ -3492,37 +3495,24 @@ where
                 // Yield due to applying CommitMerge, this fsm can be released if its
                 // channel msg count equals to expected_msg_count because it will receive
                 // a new message if its source region has applied all needed logs.
-                return expected_msg_count;
+                return;
             } else if normal.delegate.yield_state.is_some() {
                 // Yield due to other reasons, this fsm must not be released because
                 // it's possible that no new message will be sent to itself.
                 // The remaining messages will be handled in next rounds.
-                return None;
+                return;
             }
             expected_msg_count = None;
         }
-        fail_point!("before_handle_normal_3", normal.delegate.id() == 3, |_| {
-            None
-        });
-        fail_point!(
-            "before_handle_normal_1003",
-            normal.delegate.id() == 1003,
-            |_| { None }
-        );
-        while self.msg_buf.len() < self.messages_per_tick {
-            match normal.receiver.try_recv() {
-                Ok(msg) => self.msg_buf.push(msg),
-                Err(TryRecvError::Empty) => {
-                    expected_msg_count = Some(0);
-                    break;
-                }
-                Err(TryRecvError::Disconnected) => {
-                    normal.delegate.stopped = true;
-                    expected_msg_count = Some(0);
-                    break;
-                }
-            }
-        }
+        // fail_point!("before_handle_normal_3", normal.delegate.id() == 3, |_| {
+        //     None
+        // });
+        // fail_point!(
+        //     "before_handle_normal_1003",
+        //     normal.delegate.id() == 1003,
+        //     |_| { None }
+        // );
+        self.msg_buf.push(msg);
         normal.handle_tasks(&mut self.apply_ctx, &mut self.msg_buf);
         if normal.delegate.wait_merge_state.is_some() {
             // Check it again immediately as catching up logs can be very fast.
@@ -3531,7 +3521,7 @@ where
             // Let it continue to run next time.
             expected_msg_count = None;
         }
-        expected_msg_count
+        // expected_msg_count
     }
 
     fn end(&mut self, fsms: &mut [Box<ApplyFsm<EK>>]) {
@@ -3583,7 +3573,7 @@ where
     }
 }
 
-impl<EK, W> HandlerBuilder<ApplyFsm<EK>, ControlFsm> for Builder<EK, W>
+impl<EK, W> hash_system::HandlerBuilder<ApplyFsm<EK>, ControlFsm> for Builder<EK, W>
 where
     EK: KvEngine,
     W: WriteBatch<EK>,
@@ -3617,16 +3607,16 @@ pub struct ApplyRouter<EK>
 where
     EK: KvEngine,
 {
-    pub router: BatchRouter<ApplyFsm<EK>, ControlFsm>,
+    pub router: hash_system::Router<ApplyFsm<EK>, ControlFsm>,
 }
 
 impl<EK> Deref for ApplyRouter<EK>
 where
     EK: KvEngine,
 {
-    type Target = BatchRouter<ApplyFsm<EK>, ControlFsm>;
+    type Target = hash_system::Router<ApplyFsm<EK>, ControlFsm>;
 
-    fn deref(&self) -> &BatchRouter<ApplyFsm<EK>, ControlFsm> {
+    fn deref(&self) -> &hash_system::Router<ApplyFsm<EK>, ControlFsm> {
         &self.router
     }
 }
@@ -3635,7 +3625,7 @@ impl<EK> DerefMut for ApplyRouter<EK>
 where
     EK: KvEngine,
 {
-    fn deref_mut(&mut self) -> &mut BatchRouter<ApplyFsm<EK>, ControlFsm> {
+    fn deref_mut(&mut self) -> &mut hash_system::Router<ApplyFsm<EK>, ControlFsm> {
         &mut self.router
     }
 }
@@ -3713,46 +3703,46 @@ where
         // queued inside both queue of control fsm and normal fsm, which can reorder
         // messages.
         let (sender, apply_fsm) = ApplyFsm::from_registration(reg);
-        let mailbox = BasicMailbox::new(sender, apply_fsm);
-        self.register(region_id, mailbox);
+        // let mailbox = BasicMailbox::new(sender, apply_fsm);
+        self.register(region_id, apply_fsm);
     }
 }
 
 pub struct ApplyBatchSystem<EK: KvEngine> {
-    system: BatchSystem<ApplyFsm<EK>, ControlFsm>,
+    system: hash_system::System<ApplyFsm<EK>, ControlFsm>,
 }
 
 impl<EK: KvEngine> Deref for ApplyBatchSystem<EK> {
-    type Target = BatchSystem<ApplyFsm<EK>, ControlFsm>;
+    type Target = hash_system::System<ApplyFsm<EK>, ControlFsm>;
 
-    fn deref(&self) -> &BatchSystem<ApplyFsm<EK>, ControlFsm> {
+    fn deref(&self) -> &hash_system::System<ApplyFsm<EK>, ControlFsm> {
         &self.system
     }
 }
 
 impl<EK: KvEngine> DerefMut for ApplyBatchSystem<EK> {
-    fn deref_mut(&mut self) -> &mut BatchSystem<ApplyFsm<EK>, ControlFsm> {
+    fn deref_mut(&mut self) -> &mut hash_system::System<ApplyFsm<EK>, ControlFsm> {
         &mut self.system
     }
 }
 
 impl<EK: KvEngine> ApplyBatchSystem<EK> {
     pub fn schedule_all<'a, ER: RaftEngine>(&self, peers: impl Iterator<Item = &'a Peer<EK, ER>>) {
-        let mut mailboxes = Vec::with_capacity(peers.size_hint().0);
+        let mut fsms = Vec::with_capacity(peers.size_hint().0);
         for peer in peers {
             let (tx, fsm) = ApplyFsm::from_peer(peer);
-            mailboxes.push((peer.region().get_id(), BasicMailbox::new(tx, fsm)));
+            fsms.push((peer.region().get_id(), fsm));
         }
-        self.router().register_all(mailboxes);
+        self.router().register_all(fsms);
     }
 }
 
 pub fn create_apply_batch_system<EK: KvEngine>(
     cfg: &Config,
 ) -> (ApplyRouter<EK>, ApplyBatchSystem<EK>) {
-    let (tx, _) = loose_bounded(usize::MAX);
+    // let (tx, _) = loose_bounded(usize::MAX);
     let (router, system) =
-        batch_system::create_system(&cfg.apply_batch_system, tx, Box::new(ControlFsm));
+        hash_system::create_system(&cfg.apply_batch_system, Box::new(ControlFsm));
     (ApplyRouter { router }, ApplyBatchSystem { system })
 }
 

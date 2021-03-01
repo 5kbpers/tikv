@@ -159,7 +159,7 @@ where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    pub router: BatchRouter<PeerFsm<EK, ER>, StoreFsm<EK>>,
+    pub router: hash_system::Router<PeerFsm<EK, ER>, StoreFsm<EK>>,
 }
 
 impl<EK, ER> Clone for RaftRouter<EK, ER>
@@ -179,9 +179,9 @@ where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    type Target = BatchRouter<PeerFsm<EK, ER>, StoreFsm<EK>>;
+    type Target = hash_system::Router<PeerFsm<EK, ER>, StoreFsm<EK>>;
 
-    fn deref(&self) -> &BatchRouter<PeerFsm<EK, ER>, StoreFsm<EK>> {
+    fn deref(&self) -> &hash_system::Router<PeerFsm<EK, ER>, StoreFsm<EK>> {
         &self.router
     }
 }
@@ -407,9 +407,9 @@ where
     #[inline]
     fn schedule_store_tick(&self, tick: StoreTick, timeout: Duration) {
         if !is_zero_duration(&timeout) {
-            let mb = self.router.control_mailbox();
+            let router = self.router.clone();
             let delay = self.timer.delay(timeout).compat().map(move |_| {
-                if let Err(e) = mb.force_send(StoreMsg::Tick(tick)) {
+                if let Err(e) = router.send_control(StoreMsg::Tick(tick)) {
                     info!(
                         "failed to schedule store tick, are we shutting down?";
                         "tick" => ?tick,
@@ -724,10 +724,10 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
     }
 }
 
-impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, StoreFsm<EK>>
-    for RaftPoller<EK, ER, T>
+impl<EK: KvEngine, ER: RaftEngine, T: Transport>
+    hash_system::PollHandler<PeerFsm<EK, ER>, StoreFsm<EK>> for RaftPoller<EK, ER, T>
 {
-    fn begin(&mut self, _batch_size: usize) {
+    fn begin(&mut self) {
         self.previous_metrics = self.poll_ctx.raft_metrics.clone();
         self.poll_ctx.processed_fsm_count = 0;
         self.poll_ctx.pending_count = 0;
@@ -758,78 +758,80 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
         }
     }
 
-    fn handle_control(&mut self, store: &mut StoreFsm<EK>) -> Option<usize> {
-        let mut expected_msg_count = None;
-        while self.store_msg_buf.len() < self.messages_per_tick {
-            match store.receiver.try_recv() {
-                Ok(msg) => self.store_msg_buf.push(msg),
-                Err(TryRecvError::Empty) => {
-                    expected_msg_count = Some(0);
-                    break;
-                }
-                Err(TryRecvError::Disconnected) => {
-                    store.store.stopped = true;
-                    expected_msg_count = Some(0);
-                    break;
-                }
-            }
-        }
+    fn handle_control_msg(&mut self, store: &mut StoreFsm<EK>, msg: StoreMsg<EK>) {
+        // let mut expected_msg_count = None;
+        // while self.store_msg_buf.len() < self.messages_per_tick {
+        //     match store.receiver.try_recv() {
+        //         Ok(msg) => self.store_msg_buf.push(msg),
+        //         Err(TryRecvError::Empty) => {
+        //             expected_msg_count = Some(0);
+        //             break;
+        //         }
+        //         Err(TryRecvError::Disconnected) => {
+        //             store.store.stopped = true;
+        //             expected_msg_count = Some(0);
+        //             break;
+        //         }
+        //     }
+        // }
+        self.store_msg_buf.push(msg);
         let mut delegate = StoreFsmDelegate {
             fsm: store,
             ctx: &mut self.poll_ctx,
         };
         delegate.handle_msgs(&mut self.store_msg_buf);
-        expected_msg_count
+        // expected_msg_count
     }
 
-    fn handle_normal(&mut self, peer: &mut PeerFsm<EK, ER>) -> Option<usize> {
-        let mut expected_msg_count = None;
+    fn handle_normal_msg(&mut self, peer: &mut PeerFsm<EK, ER>, msg: PeerMsg<EK>) {
+        // let mut expected_msg_count = None;
 
-        fail_point!(
-            "pause_on_peer_collect_message",
-            peer.peer_id() == 1,
-            |_| unreachable!()
-        );
+        // fail_point!(
+        //     "pause_on_peer_collect_message",
+        //     peer.peer_id() == 1,
+        //     |_| unreachable!()
+        // );
 
-        fail_point!(
-            "on_peer_collect_message_2",
-            peer.peer_id() == 2,
-            |_| unreachable!()
-        );
+        // fail_point!(
+        //     "on_peer_collect_message_2",
+        //     peer.peer_id() == 2,
+        //     |_| unreachable!()
+        // );
 
-        while self.peer_msg_buf.len() < self.messages_per_tick {
-            match peer.receiver.try_recv() {
-                // TODO: we may need a way to optimize the message copy.
-                Ok(msg) => {
-                    fail_point!(
-                        "pause_on_peer_destroy_res",
-                        peer.peer_id() == 1
-                            && matches!(
-                                msg,
-                                PeerMsg::ApplyRes {
-                                    res: ApplyTaskRes::Destroy { .. },
-                                }
-                            ),
-                        |_| unreachable!()
-                    );
-                    self.peer_msg_buf.push(msg);
-                }
-                Err(TryRecvError::Empty) => {
-                    expected_msg_count = Some(0);
-                    break;
-                }
-                Err(TryRecvError::Disconnected) => {
-                    peer.stop();
-                    expected_msg_count = Some(0);
-                    break;
-                }
-            }
-        }
+        // while self.peer_msg_buf.len() < self.messages_per_tick {
+        //     match peer.receiver.try_recv() {
+        //         // TODO: we may need a way to optimize the message copy.
+        //         Ok(msg) => {
+        //             fail_point!(
+        //                 "pause_on_peer_destroy_res",
+        //                 peer.peer_id() == 1
+        //                     && matches!(
+        //                         msg,
+        //                         PeerMsg::ApplyRes {
+        //                             res: ApplyTaskRes::Destroy { .. },
+        //                         }
+        //                     ),
+        //                 |_| unreachable!()
+        //             );
+        //             self.peer_msg_buf.push(msg);
+        //         }
+        //         Err(TryRecvError::Empty) => {
+        //             expected_msg_count = Some(0);
+        //             break;
+        //         }
+        //         Err(TryRecvError::Disconnected) => {
+        //             peer.stop();
+        //             expected_msg_count = Some(0);
+        //             break;
+        //         }
+        //     }
+        // }
+        self.peer_msg_buf.push(msg);
         let mut delegate = PeerFsmDelegate::new(peer, &mut self.poll_ctx);
         delegate.handle_msgs(&mut self.peer_msg_buf);
         delegate.collect_ready();
         self.poll_ctx.processed_fsm_count += 1;
-        expected_msg_count
+        // expected_msg_count
     }
 
     fn end(&mut self, peers: &mut [Box<PeerFsm<EK, ER>>]) {
@@ -1041,7 +1043,8 @@ impl<EK: KvEngine, ER: RaftEngine, T> RaftPollerBuilder<EK, ER, T> {
     }
 }
 
-impl<EK, ER, T> HandlerBuilder<PeerFsm<EK, ER>, StoreFsm<EK>> for RaftPollerBuilder<EK, ER, T>
+impl<EK, ER, T> hash_system::HandlerBuilder<PeerFsm<EK, ER>, StoreFsm<EK>>
+    for RaftPollerBuilder<EK, ER, T>
 where
     EK: KvEngine + 'static,
     ER: RaftEngine + 'static,
@@ -1119,7 +1122,7 @@ struct Workers<EK: KvEngine> {
 }
 
 pub struct RaftBatchSystem<EK: KvEngine, ER: RaftEngine> {
-    system: BatchSystem<PeerFsm<EK, ER>, StoreFsm<EK>>,
+    system: hash_system::System<PeerFsm<EK, ER>, StoreFsm<EK>>,
     apply_router: ApplyRouter<EK>,
     apply_system: ApplyBatchSystem<EK>,
     router: RaftRouter<EK, ER>,
@@ -1295,13 +1298,13 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
 
         let tag = format!("raftstore-{}", store.get_id());
         self.system.spawn(tag, builder);
-        let mut mailboxes = Vec::with_capacity(region_peers.len());
+        let mut fsms = Vec::with_capacity(region_peers.len());
         let mut address = Vec::with_capacity(region_peers.len());
         for (tx, fsm) in region_peers {
             address.push(fsm.region_id());
-            mailboxes.push((fsm.region_id(), BasicMailbox::new(tx, fsm)));
+            fsms.push((fsm.region_id(), fsm));
         }
-        self.router.register_all(mailboxes);
+        self.router.register_all(fsms);
 
         // Make sure Msg::Start is the first message each FSM received.
         for addr in address {
@@ -1356,10 +1359,9 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
 pub fn create_raft_batch_system<EK: KvEngine, ER: RaftEngine>(
     cfg: &Config,
 ) -> (RaftRouter<EK, ER>, RaftBatchSystem<EK, ER>) {
-    let (store_tx, store_fsm) = StoreFsm::new(cfg);
+    let (_, store_fsm) = StoreFsm::new(cfg);
     let (apply_router, apply_system) = create_apply_batch_system(&cfg);
-    let (router, system) =
-        batch_system::create_system(&cfg.store_batch_system, store_tx, store_fsm);
+    let (router, system) = hash_system::create_system(&cfg.store_batch_system, store_fsm);
     let raft_router = RaftRouter { router };
     let system = RaftBatchSystem {
         system,
@@ -1772,8 +1774,8 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'a, EK, ER
         meta.regions
             .insert(region_id, peer.get_peer().region().to_owned());
 
-        let mailbox = BasicMailbox::new(tx, peer);
-        self.ctx.router.register(region_id, mailbox);
+        // let mailbox = BasicMailbox::new(tx, peer);
+        self.ctx.router.register(region_id, peer);
         self.ctx
             .router
             .force_send(region_id, PeerMsg::Start)
