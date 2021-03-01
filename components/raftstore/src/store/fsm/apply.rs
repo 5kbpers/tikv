@@ -3491,12 +3491,12 @@ where
                 expected_msg_count = Some(normal.receiver.len());
             }
             normal.resume_pending(&mut self.apply_ctx);
-            if normal.delegate.wait_merge_state.is_some() {
+            if normal.delegate.wait_merge_state.is_some() || normal.delegate.yield_state.is_some() {
                 // Yield due to applying CommitMerge, this fsm can be released if its
                 // channel msg count equals to expected_msg_count because it will receive
                 // a new message if its source region has applied all needed logs.
-                return;
-            } else if normal.delegate.yield_state.is_some() {
+                //     return;
+                // } else if  {
                 // Yield due to other reasons, this fsm must not be released because
                 // it's possible that no new message will be sent to itself.
                 // The remaining messages will be handled in next rounds.
