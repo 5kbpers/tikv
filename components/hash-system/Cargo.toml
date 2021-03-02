@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2018"
 
 [features]
+default = ["test-runner", "protobuf-codec"]
+test-runner = ["derive_more"]
 protobuf-codec = [
   "tikv_util/protobuf-codec",
 ]
@@ -23,3 +25,8 @@ slog-global = { version = "0.1", git = "https://github.com/breeswish/slog-global
 derive_more = { version = "0.99", optional = true }
 batch-system = { path = "../batch-system", default-features = false }
 fxhash = "0.2.1"
+
+[[test]]
+name = "tests"
+path = "tests/cases/mod.rs"
+required-features = ["test-runner"]

@@ -3524,10 +3524,10 @@ where
         // expected_msg_count
     }
 
-    fn end(&mut self, fsms: &mut [Box<ApplyFsm<EK>>]) {
+    fn end(&mut self, fsms: &mut HashMap<u64, Box<ApplyFsm<EK>>>) {
         let is_synced = self.apply_ctx.flush();
         if is_synced {
-            for fsm in fsms {
+            for (_, fsm) in fsms {
                 fsm.delegate.last_sync_apply_index = fsm.delegate.apply_state.get_applied_index();
             }
         }

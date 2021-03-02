@@ -1732,7 +1732,7 @@ where
             }
         };
 
-        Some(CollectedReady::new(invoke_ctx, ready))
+        Some(CollectedReady::new(invoke_ctx, ready, self.region_id))
     }
 
     pub fn post_raft_ready_append<T: Transport>(

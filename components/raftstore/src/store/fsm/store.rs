@@ -614,7 +614,7 @@ pub struct RaftPoller<EK: KvEngine + 'static, ER: RaftEngine + 'static, T: 'stat
 }
 
 impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
-    fn handle_raft_ready(&mut self, peers: &mut [Box<PeerFsm<EK, ER>>]) {
+    fn handle_raft_ready(&mut self, peers: &mut HashMap<u64, Box<PeerFsm<EK, ER>>>) {
         // Only enable the fail point when the store id is equal to 3, which is
         // the id of slow store in tests.
         fail_point!("on_raft_ready", self.poll_ctx.store_id() == 3, |_| {});
@@ -669,7 +669,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
         if ready_cnt != 0 {
             let mut ready_res = mem::take(&mut self.poll_ctx.ready_res);
             for ready in ready_res.drain(..) {
-                PeerFsmDelegate::new(&mut peers[ready.batch_offset], &mut self.poll_ctx)
+                PeerFsmDelegate::new(peers.get_mut(&ready.region_id).unwrap(), &mut self.poll_ctx)
                     .post_raft_ready_append(ready);
             }
         }
@@ -834,7 +834,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport>
         // expected_msg_count
     }
 
-    fn end(&mut self, peers: &mut [Box<PeerFsm<EK, ER>>]) {
+    fn end(&mut self, peers: &mut HashMap<u64, Box<PeerFsm<EK, ER>>>) {
         self.flush_ticks();
         if self.poll_ctx.has_ready {
             self.handle_raft_ready(peers);

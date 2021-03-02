@@ -13,7 +13,7 @@ pub trait PollHandler<N: Fsm, C: Fsm> {
     fn begin(&mut self);
     fn handle_normal_msg(&mut self, fsm: &mut N, msg: N::Message);
     fn handle_control_msg(&mut self, fsm: &mut C, msg: C::Message);
-    fn end(&mut self, normals: &mut [Box<N>]);
+    fn end(&mut self, normals: &mut HashMap<u64, Box<N>>);
     fn pause(&mut self) {}
 }
 
@@ -62,7 +62,7 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
         let mut batch = Vec::with_capacity(self.max_batch_size);
         let mut stopped = false;
 
-        while !stopped && !self.recv_batch(&mut batch) {
+        while !stopped && self.recv_batch(&mut batch) {
             let mut handled_normals = HashSet::default();
             self.handler.begin();
             for msg in std::mem::take(&mut batch) {
@@ -86,14 +86,13 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                     Message::Stop => stopped = true,
                 }
             }
-            let addrs: Vec<_> = handled_normals.into_iter().collect();
-            let mut normals: Vec<_> = addrs
-                .iter()
-                .map(|addr| self.normals.remove(&addr).unwrap())
+            let mut normals: HashMap<_, _> = handled_normals
+                .into_iter()
+                .map(|addr| (addr, self.normals.remove(&addr).unwrap()))
                 .collect();
             self.handler.end(&mut normals);
-            for (i, fsm) in normals.into_iter().enumerate() {
-                self.normals.insert(addrs[i], fsm);
+            for (addr, fsm) in normals {
+                self.normals.insert(addr, fsm);
             }
         }
     }
