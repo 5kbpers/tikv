@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use batch_system::{Config, Fsm};
@@ -59,8 +60,9 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
 
     pub fn poll(&mut self) {
         let mut batch = Vec::with_capacity(self.max_batch_size);
+        let mut stopped = false;
 
-        while !self.recv_batch(&mut batch) {
+        while !stopped && !self.recv_batch(&mut batch) {
             let mut handled_normals = HashSet::default();
             self.handler.begin();
             for msg in std::mem::take(&mut batch) {
@@ -81,7 +83,7 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                     Message::CloseNormal(addr) => {
                         self.normals.remove(&addr);
                     }
-                    Message::Stop => break,
+                    Message::Stop => stopped = true,
                 }
             }
             let addrs: Vec<_> = handled_normals.into_iter().collect();

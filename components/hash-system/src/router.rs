@@ -156,6 +156,9 @@ impl<N: Fsm, C: Fsm> Router<N, C> {
     pub fn broadcast_shutdown(&self) {
         info!("broadcasting shutdown");
         self.stopped.store(true, Ordering::SeqCst);
+        self.senders
+            .iter()
+            .for_each(|tx| tx.send(Message::Stop).unwrap());
     }
 
     /// Close the mailbox of address.
