@@ -3480,7 +3480,7 @@ where
         unimplemented!()
     }
 
-    fn handle_normal_msg(&mut self, normal: &mut ApplyFsm<EK>, msg: Msg<EK>) {
+    fn handle_normal_msgs(&mut self, normal: &mut ApplyFsm<EK>, mut msgs: Vec<Msg<EK>>) {
         let mut expected_msg_count = None;
         normal.delegate.handle_start = Some(Instant::now_coarse());
         if normal.delegate.yield_state.is_some() {
@@ -3512,7 +3512,7 @@ where
         //     normal.delegate.id() == 1003,
         //     |_| { None }
         // );
-        self.msg_buf.push(msg);
+        self.msg_buf.append(&mut msgs);
         normal.handle_tasks(&mut self.apply_ctx, &mut self.msg_buf);
         if normal.delegate.wait_merge_state.is_some() {
             // Check it again immediately as catching up logs can be very fast.

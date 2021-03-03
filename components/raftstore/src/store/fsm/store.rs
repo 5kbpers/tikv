@@ -783,7 +783,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport>
         // expected_msg_count
     }
 
-    fn handle_normal_msg(&mut self, peer: &mut PeerFsm<EK, ER>, msg: PeerMsg<EK>) {
+    fn handle_normal_msgs(&mut self, peer: &mut PeerFsm<EK, ER>, mut msgs: Vec<PeerMsg<EK>>) {
         // let mut expected_msg_count = None;
 
         // fail_point!(
@@ -826,7 +826,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport>
         //         }
         //     }
         // }
-        self.peer_msg_buf.push(msg);
+        self.peer_msg_buf.append(&mut msgs);
         let mut delegate = PeerFsmDelegate::new(peer, &mut self.poll_ctx);
         delegate.handle_msgs(&mut self.peer_msg_buf);
         delegate.collect_ready();

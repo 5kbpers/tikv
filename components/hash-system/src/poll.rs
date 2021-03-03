@@ -11,7 +11,7 @@ use crate::router::Router;
 
 pub trait PollHandler<N: Fsm, C: Fsm> {
     fn begin(&mut self);
-    fn handle_normal_msg(&mut self, fsm: &mut N, msg: N::Message);
+    fn handle_normal_msgs(&mut self, fsm: &mut N, msgs: Vec<N::Message>);
     fn handle_control_msg(&mut self, fsm: &mut C, msg: C::Message);
     fn end(&mut self, normals: &mut HashMap<u64, Box<N>>);
     fn pause(&mut self) {}
@@ -60,10 +60,11 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
 
     pub fn poll(&mut self) {
         let mut batch = Vec::with_capacity(self.max_batch_size);
+        let mut closed_fsms = Vec::new();
         let mut stopped = false;
 
         while !stopped && self.recv_batch(&mut batch) {
-            let mut handled_normals = HashSet::default();
+            let mut normal_msgs: HashMap<u64, Vec<_>> = HashMap::default();
             self.handler.begin();
             for msg in std::mem::take(&mut batch) {
                 match msg {
@@ -71,9 +72,8 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                         .handler
                         .handle_control_msg(self.control.as_mut().unwrap(), m),
                     Message::NormalMsg((addr, m)) => {
-                        if let Some(fsm) = self.normals.get_mut(&addr) {
-                            self.handler.handle_normal_msg(fsm, m);
-                            handled_normals.insert(addr);
+                        if self.normals.get(&addr).is_some() {
+                            normal_msgs.entry(addr).or_default().push(m);
                         }
                     }
                     Message::RegisterNormal((addr, fsm)) => {
@@ -81,18 +81,24 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                     }
                     Message::RegisterControl(fsm) => self.control = Some(fsm),
                     Message::CloseNormal(addr) => {
-                        self.normals.remove(&addr);
+                        closed_fsms.push(addr);
+                        // self.normals.remove(&addr);
                     }
                     Message::Stop => stopped = true,
                 }
             }
-            let mut normals: HashMap<_, _> = handled_normals
-                .into_iter()
-                .map(|addr| (addr, self.normals.remove(&addr).unwrap()))
-                .collect();
+            let mut normals = HashMap::default();
+            for (addr, msgs) in normal_msgs {
+                let mut fsm = self.normals.remove(&addr).unwrap();
+                self.handler.handle_normal_msgs(&mut fsm, msgs);
+                let _ = normals.insert(addr, fsm);
+            }
             self.handler.end(&mut normals);
             for (addr, fsm) in normals {
                 self.normals.insert(addr, fsm);
+            }
+            for addr in std::mem::take(&mut closed_fsms) {
+                self.normals.remove(&addr);
             }
         }
     }

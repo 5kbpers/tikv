@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use batch_system::Fsm;
-use collections::HashSet;
+use collections::HashMap;
 use crossbeam::{SendError, Sender, TrySendError};
 use tikv_util::lru::LruCache;
 use tikv_util::Either;
@@ -11,8 +11,8 @@ use tikv_util::Either;
 use crate::poll::Message;
 
 pub struct Router<N: Fsm, C: Fsm> {
-    normals: Arc<Mutex<HashSet<u64>>>,
-    caches: Cell<LruCache<u64, ()>>,
+    normals: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
+    caches: Cell<LruCache<u64, Arc<AtomicBool>>>,
     senders: Vec<Sender<Message<N, C>>>,
     stopped: Arc<AtomicBool>,
 }
@@ -21,7 +21,7 @@ impl<N: Fsm, C: Fsm> Router<N, C> {
     pub fn new(senders: Vec<Sender<Message<N, C>>>) -> Self {
         Self {
             senders,
-            normals: Arc::new(Mutex::new(HashSet::default())),
+            normals: Arc::new(Mutex::new(HashMap::default())),
             caches: Cell::new(LruCache::with_capacity_and_sample(1024, 7)),
             stopped: Arc::new(AtomicBool::new(false)),
         }
@@ -39,8 +39,9 @@ impl<N: Fsm, C: Fsm> Router<N, C> {
     pub fn register(&self, addr: u64, fsm: Box<N>) {
         let mut normals = self.normals.lock().unwrap();
         let caches = unsafe { &mut *self.caches.as_ptr() };
-        normals.insert(addr);
-        caches.insert(addr, ());
+        let state = Arc::new(AtomicBool::new(true));
+        normals.insert(addr, state.clone());
+        caches.insert(addr, state.clone());
         let shard_id = self.shard_id(addr);
         if self.senders[shard_id]
             .send(Message::RegisterNormal((addr, fsm)))
@@ -55,8 +56,9 @@ impl<N: Fsm, C: Fsm> Router<N, C> {
         let caches = unsafe { &mut *self.caches.as_ptr() };
         normals.reserve(addrs.len());
         for (addr, fsm) in addrs {
-            normals.insert(addr);
-            caches.insert(addr, ());
+            let state = Arc::new(AtomicBool::new(true));
+            normals.insert(addr, state.clone());
+            caches.insert(addr, state.clone());
             let shard_id = self.shard_id(addr);
             if self.senders[shard_id]
                 .send(Message::RegisterNormal((addr, fsm)))
@@ -77,12 +79,19 @@ impl<N: Fsm, C: Fsm> Router<N, C> {
         msg: N::Message,
     ) -> Either<Result<(), TrySendError<N::Message>>, N::Message> {
         let caches = unsafe { &mut *self.caches.as_ptr() };
-        if caches.get(&addr).is_none() {
-            let normals = self.normals.lock().unwrap();
-            if normals.get(&addr).is_none() {
-                return Either::Right(msg);
+        match caches.get(&addr) {
+            Some(state) if state.load(Ordering::Acquire) => (),
+            _ => {
+                let normals = self.normals.lock().unwrap();
+                match normals.get(&addr) {
+                    Some(state) if state.load(Ordering::Acquire) => {
+                        caches.insert(addr, state.clone())
+                    }
+                    _ => {
+                        return Either::Right(msg);
+                    }
+                }
             }
-            caches.insert(addr, ());
         }
 
         let shard_id = self.shard_id(addr);
@@ -147,8 +156,10 @@ impl<N: Fsm, C: Fsm> Router<N, C> {
     /// Try to notify all normal fsm a message.
     pub fn broadcast_normal(&self, mut msg_gen: impl FnMut() -> N::Message) {
         let normals = self.normals.lock().unwrap();
-        normals.iter().for_each(|addr| {
-            let _ = self.force_send(*addr, msg_gen());
+        normals.iter().for_each(|(addr, state)| {
+            if state.load(Ordering::Acquire) {
+                let _ = self.force_send(*addr, msg_gen());
+            }
         })
     }
 
@@ -165,6 +176,12 @@ impl<N: Fsm, C: Fsm> Router<N, C> {
     pub fn close(&self, addr: u64) {
         info!("[region {}] shutdown mailbox", addr);
         let shard_id = self.shard_id(addr);
+        let mut normals = self.normals.lock().unwrap();
+        if let Some(state) = normals.remove(&addr) {
+            state.store(false, Ordering::Release);
+        }
+        let caches = unsafe { &mut *self.caches.as_ptr() };
+        caches.remove(&addr);
         if self.senders[shard_id]
             .send(Message::CloseNormal(addr))
             .is_err()

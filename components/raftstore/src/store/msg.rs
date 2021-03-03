@@ -449,7 +449,7 @@ pub enum PeerMsg<EK: KvEngine> {
 impl<EK: KvEngine> fmt::Debug for PeerMsg<EK> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PeerMsg::RaftMessage(_) => write!(fmt, "Raft Message"),
+            PeerMsg::RaftMessage(m) => write!(fmt, "Raft Message"),
             PeerMsg::RaftCommand(_) => write!(fmt, "Raft Command"),
             PeerMsg::Tick(tick) => write! {
                 fmt,

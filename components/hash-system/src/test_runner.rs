@@ -92,9 +92,11 @@ impl PollHandler<Runner, Runner> for Handler {
         self.handle(control, msg)
     }
 
-    fn handle_normal_msg(&mut self, normal: &mut Runner, msg: Message) {
-        self.local.normal += 1;
-        self.handle(normal, msg)
+    fn handle_normal_msgs(&mut self, normal: &mut Runner, msgs: Vec<Message>) {
+        for msg in msgs {
+            self.local.normal += 1;
+            self.handle(normal, msg)
+        }
     }
 
     fn end(&mut self, _normals: &mut HashMap<u64, Box<Runner>>) {
