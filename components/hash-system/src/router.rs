@@ -32,7 +32,7 @@ impl<N: Fsm, C: Fsm> Router<N, C> {
     }
 
     fn shard_id(&self, addr: u64) -> usize {
-        fxhash::hash(&addr) % self.senders.len()
+        seahash::hash(&(addr.to_be_bytes())) as usize % self.senders.len()
     }
 
     /// Register a mailbox with given address.
