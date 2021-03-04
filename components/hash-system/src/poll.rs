@@ -36,12 +36,12 @@ pub struct Poller<N: Fsm, C: Fsm, Handler> {
 }
 
 impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
-    fn recv_batch(&mut self, batch: &mut Vec<Message<N, C>>) -> bool {
+    fn recv_batch(&mut self, batch: &mut Vec<Message<N, C>>) {
         loop {
             if let Ok(msg) = self.msg_receiver.try_recv() {
                 batch.push(msg);
                 if batch.len() >= self.max_batch_size {
-                    return true;
+                    return;
                 }
                 continue;
             }
@@ -54,8 +54,6 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
             }
             break;
         }
-
-        !batch.is_empty()
     }
 
     pub fn poll(&mut self) {
@@ -63,7 +61,8 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
         let mut closed_fsms = Vec::new();
         let mut stopped = false;
 
-        while !stopped && self.recv_batch(&mut batch) {
+        while !stopped {
+            self.recv_batch(&mut batch);
             let mut normal_msgs: HashMap<u64, Vec<_>> = HashMap::default();
             self.handler.begin();
             for msg in std::mem::take(&mut batch) {

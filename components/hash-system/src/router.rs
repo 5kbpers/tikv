@@ -155,7 +155,10 @@ impl<N: Fsm, C: Fsm> Router<N, C> {
 
     /// Try to notify all normal fsm a message.
     pub fn broadcast_normal(&self, mut msg_gen: impl FnMut() -> N::Message) {
-        let normals = self.normals.lock().unwrap();
+        let normals;
+        {
+            normals = self.normals.lock().unwrap().clone();
+        }
         normals.iter().for_each(|(addr, state)| {
             if state.load(Ordering::Acquire) {
                 let _ = self.force_send(*addr, msg_gen());
