@@ -34,6 +34,7 @@ use kvproto::raft_cmdpb::{
 use kvproto::raft_serverpb::{
     MergeState, PeerState, RaftApplyState, RaftTruncatedState, RegionLocalState,
 };
+use prometheus::local::LocalHistogram;
 use raft::eraftpb::{
     ConfChange, ConfChangeType, ConfChangeV2, Entry, EntryType, Snapshot as RaftSnapshot,
 };
@@ -366,6 +367,8 @@ where
     /// happened before `WriteBatch::write` and after `SSTImporter::delete`. We shall make sure that
     /// this entry will never apply again at first, then we can delete the ssts files.
     delete_ssts: Vec<SstMeta>,
+
+    batch_message: LocalHistogram,
 }
 
 impl<EK, W> ApplyContext<EK, W>
@@ -413,6 +416,7 @@ where
             delete_ssts: vec![],
             store_id,
             pending_create_peers,
+            batch_message: APPLY_BATCH_MESSAGE_HISTOGRAM.local(),
         }
     }
 
@@ -561,6 +565,7 @@ where
 
         let elapsed = t.elapsed();
         STORE_APPLY_LOG_HISTOGRAM.observe(duration_to_sec(elapsed) as f64);
+        self.batch_message.flush();
 
         slow_log!(
             elapsed,
@@ -3441,6 +3446,7 @@ where
     apply_ctx: ApplyContext<EK, W>,
     messages_per_tick: usize,
     cfg_tracker: Tracker<Config>,
+    message_count: usize,
 }
 
 impl<EK, W> PollHandler<ApplyFsm<EK>, ControlFsm> for ApplyPoller<EK, W>
@@ -3516,6 +3522,7 @@ where
                 }
             }
         }
+        self.message_count += self.msg_buf.len();
         normal.handle_tasks(&mut self.apply_ctx, &mut self.msg_buf);
         if normal.delegate.wait_merge_state.is_some() {
             // Check it again immediately as catching up logs can be very fast.
@@ -3528,12 +3535,16 @@ where
     }
 
     fn end(&mut self, fsms: &mut [Box<ApplyFsm<EK>>]) {
+        self.apply_ctx
+            .batch_message
+            .observe(self.message_count as f64);
         let is_synced = self.apply_ctx.flush();
         if is_synced {
             for fsm in fsms {
                 fsm.delegate.last_sync_apply_index = fsm.delegate.apply_state.get_applied_index();
             }
         }
+        self.message_count = 0;
     }
 }
 
@@ -3601,6 +3612,7 @@ where
             ),
             messages_per_tick: cfg.messages_per_tick,
             cfg_tracker: self.cfg.clone().tracker(self.tag.clone()),
+            message_count: 0,
         }
     }
 }

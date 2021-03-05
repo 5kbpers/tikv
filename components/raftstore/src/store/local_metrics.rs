@@ -410,6 +410,7 @@ pub struct RaftMetrics {
     pub commit_log: LocalHistogram,
     pub leader_missing: Arc<Mutex<HashSet<u64>>>,
     pub invalid_proposal: RaftInvalidProposeMetrics,
+    pub batch_message: LocalHistogram,
 }
 
 impl Default for RaftMetrics {
@@ -426,6 +427,7 @@ impl Default for RaftMetrics {
             commit_log: PEER_COMMIT_LOG_HISTOGRAM.local(),
             leader_missing: Arc::default(),
             invalid_proposal: Default::default(),
+            batch_message: PEER_BATCH_MESSAGE_HISTOGRAM.local(),
         }
     }
 }

@@ -498,4 +498,17 @@ lazy_static! {
         ).unwrap();
     pub static ref COMPACTION_GUARD_ACTION_COUNTER: CompactionGuardActionVec =
         auto_flush_from!(COMPACTION_GUARD_ACTION_COUNTER_VEC, CompactionGuardActionVec);
+
+    pub static ref PEER_BATCH_MESSAGE_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_peer_batch_message_count",
+            "Bucketed histogram of peer batch message count.",
+            exponential_buckets(1.0, 2.0, 24).unwrap()
+        ).unwrap();
+    pub static ref APPLY_BATCH_MESSAGE_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_apply_batch_message_count",
+            "Bucketed histogram of apply batch message count.",
+            exponential_buckets(1.0, 2.0, 24).unwrap()
+        ).unwrap();
 }

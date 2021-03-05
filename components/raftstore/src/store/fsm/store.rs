@@ -610,6 +610,7 @@ pub struct RaftPoller<EK: KvEngine + 'static, ER: RaftEngine + 'static, T: 'stat
     poll_ctx: PollContext<EK, ER, T>,
     messages_per_tick: usize,
     cfg_tracker: Tracker<Config>,
+    message_count: usize,
 }
 
 impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
@@ -777,6 +778,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
             fsm: store,
             ctx: &mut self.poll_ctx,
         };
+        self.message_count += self.store_msg_buf.len();
         delegate.handle_msgs(&mut self.store_msg_buf);
         expected_msg_count
     }
@@ -824,6 +826,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
                 }
             }
         }
+        self.message_count += self.peer_msg_buf.len();
         let mut delegate = PeerFsmDelegate::new(peer, &mut self.poll_ctx);
         delegate.handle_msgs(&mut self.peer_msg_buf);
         delegate.collect_ready();
@@ -841,8 +844,13 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
             .raft_metrics
             .process_ready
             .observe(duration_to_sec(self.timer.elapsed()) as f64);
+        self.poll_ctx
+            .raft_metrics
+            .batch_message
+            .observe(self.message_count as f64);
         self.poll_ctx.raft_metrics.flush();
         self.poll_ctx.store_stat.flush();
+        self.message_count = 0;
     }
 
     fn pause(&mut self) {
@@ -1100,6 +1108,7 @@ where
             messages_per_tick: ctx.cfg.messages_per_tick,
             poll_ctx: ctx,
             cfg_tracker: self.cfg.clone().tracker(tag),
+            message_count: 0,
         }
     }
 }
