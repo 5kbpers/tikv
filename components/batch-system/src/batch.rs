@@ -8,6 +8,7 @@
 use crate::config::Config;
 use crate::fsm::{Fsm, FsmScheduler};
 use crate::mailbox::BasicMailbox;
+use crate::metrics::*;
 use crate::router::Router;
 use crossbeam::channel::{self, SendError};
 use file_system::{set_io_type, IOType};
@@ -233,6 +234,7 @@ pub trait PollHandler<N, C> {
 
 /// Internal poller that fetches batch and call handler hooks for readiness.
 struct Poller<N: Fsm, C: Fsm, Handler> {
+    name_prefix: String,
     router: Router<N, C, NormalScheduler<N, C>, ControlScheduler<N, C>>,
     fsm_receiver: channel::Receiver<FsmTypes<N, C>>,
     handler: Handler,
@@ -332,6 +334,10 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
             }
             self.handler.end(&mut batch.normals);
 
+            BATCH_SYSTEM_BATCH_SIZE
+                .with_label_values(&[&self.name_prefix])
+                .observe(batch.normals.len() as f64);
+
             // Because release use `swap_remove` internally, so using pop here
             // to remove the correct FSM.
             while let Some((r, mark)) = reschedule_fsms.pop() {
@@ -386,6 +392,7 @@ where
         for i in 0..self.pool_size {
             let handler = builder.build();
             let mut poller = Poller {
+                name_prefix: name_prefix.clone(),
                 router: self.router.clone(),
                 fsm_receiver: self.receiver.clone(),
                 handler,

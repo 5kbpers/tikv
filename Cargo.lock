@@ -286,6 +286,8 @@ dependencies = [
  "crossbeam",
  "derive_more",
  "file_system",
+ "lazy_static",
+ "prometheus",
  "serde",
  "serde_derive",
  "slog",
