@@ -276,6 +276,7 @@ members = [
   "components/concurrency_manager",
   "components/file_system",
   "components/collections",
+  "components/async-batch-system",
 ]
 default-members = ["cmd"]
 

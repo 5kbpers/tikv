@@ -103,6 +103,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-batch-system"
+version = "0.1.0"
+dependencies = [
+ "batch-system",
+ "collections",
+ "crossbeam",
+ "derive_more",
+ "file_system",
+ "serde",
+ "serde_derive",
+ "slog",
+ "slog-global",
+ "tikv_util",
+ "tokio 1.4.0",
+]
+
+[[package]]
 name = "async-speed-limit"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -192,7 +209,7 @@ dependencies = [
  "slog",
  "slog-global",
  "tikv_util",
- "tokio",
+ "tokio 0.2.24",
  "url",
 ]
 
@@ -525,7 +542,7 @@ dependencies = [
  "test_util",
  "tikv",
  "tikv_util",
- "tokio",
+ "tokio 0.2.24",
  "txn_types",
 ]
 
@@ -688,7 +705,7 @@ dependencies = [
  "tikv_alloc",
  "tikv_util",
  "time 0.1.42",
- "tokio",
+ "tokio 0.2.24",
  "toml",
  "txn_types",
  "vlog",
@@ -730,7 +747,7 @@ dependencies = [
  "parking_lot 0.11.0",
  "rand 0.7.3",
  "tikv_alloc",
- "tokio",
+ "tokio 0.2.24",
  "txn_types",
 ]
 
@@ -1218,7 +1235,7 @@ dependencies = [
  "tempfile",
  "tikv_alloc",
  "tikv_util",
- "tokio",
+ "tokio 0.2.24",
  "toml",
 ]
 
@@ -1386,7 +1403,7 @@ dependencies = [
  "tempfile",
  "tikv_alloc",
  "tikv_util",
- "tokio",
+ "tokio 0.2.24",
  "url",
 ]
 
@@ -1829,7 +1846,7 @@ dependencies = [
  "indexmap",
  "log",
  "slab",
- "tokio",
+ "tokio 0.2.24",
  "tokio-util",
 ]
 
@@ -1941,7 +1958,7 @@ dependencies = [
  "itoa",
  "pin-project 1.0.1",
  "socket2",
- "tokio",
+ "tokio 0.2.24",
  "tower-service",
  "tracing",
  "want",
@@ -1961,7 +1978,7 @@ dependencies = [
  "once_cell",
  "openssl",
  "openssl-sys",
- "tokio",
+ "tokio 0.2.24",
  "tokio-openssl",
 ]
 
@@ -1974,7 +1991,7 @@ dependencies = [
  "bytes 0.5.3",
  "hyper",
  "native-tls",
- "tokio",
+ "tokio 0.2.24",
  "tokio-tls",
 ]
 
@@ -3560,7 +3577,7 @@ dependencies = [
  "tikv_alloc",
  "tikv_util",
  "time 0.1.42",
- "tokio",
+ "tokio 0.2.24",
  "txn_types",
  "uuid",
  "yatp",
@@ -3868,7 +3885,7 @@ dependencies = [
  "pin-project-lite 0.1.4",
  "serde",
  "serde_urlencoded",
- "tokio",
+ "tokio 0.2.24",
  "tokio-tls",
  "url",
  "wasm-bindgen",
@@ -3902,7 +3919,7 @@ dependencies = [
  "thiserror",
  "tikv",
  "tikv_util",
- "tokio",
+ "tokio 0.2.24",
  "txn_types",
 ]
 
@@ -3972,7 +3989,7 @@ dependencies = [
  "rustc_version",
  "serde",
  "serde_json",
- "tokio",
+ "tokio 0.2.24",
  "xml-rs",
 ]
 
@@ -3992,7 +4009,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shlex",
- "tokio",
+ "tokio 0.2.24",
  "zeroize",
 ]
 
@@ -4060,7 +4077,7 @@ dependencies = [
  "serde",
  "sha2",
  "time 0.2.23",
- "tokio",
+ "tokio 0.2.24",
 ]
 
 [[package]]
@@ -4533,7 +4550,7 @@ dependencies = [
  "test_util",
  "tikv_alloc",
  "tikv_util",
- "tokio",
+ "tokio 0.2.24",
  "txn_types",
  "uuid",
 ]
@@ -4927,7 +4944,7 @@ dependencies = [
  "test_util",
  "tikv",
  "tikv_util",
- "tokio",
+ "tokio 0.2.24",
  "tokio-timer",
  "txn_types",
 ]
@@ -5042,7 +5059,7 @@ dependencies = [
  "time 0.1.42",
  "tipb",
  "tipb_helper",
- "tokio",
+ "tokio 0.2.24",
  "toml",
  "txn_types",
  "uuid",
@@ -5335,7 +5352,7 @@ dependencies = [
  "tikv_util",
  "time 0.1.42",
  "tipb",
- "tokio",
+ "tokio 0.2.24",
  "tokio-openssl",
  "tokio-timer",
  "toml",
@@ -5445,7 +5462,7 @@ dependencies = [
  "tempfile",
  "tikv_alloc",
  "time 0.1.42",
- "tokio",
+ "tokio 0.2.24",
  "tokio-executor",
  "tokio-timer",
  "toml",
@@ -5558,6 +5575,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "134af885d758d645f0f0505c9a8b3f9bf8a348fd822e112ab5248138348f1722"
+dependencies = [
+ "autocfg 1.0.0",
+ "num_cpus",
+ "pin-project-lite 0.2.0",
+]
+
+[[package]]
 name = "tokio-executor"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5585,7 +5613,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c4b08c5f4208e699ede3df2520aca2e82401b2de33f45e96696a074480be594"
 dependencies = [
  "openssl",
- "tokio",
+ "tokio 0.2.24",
 ]
 
 [[package]]
@@ -5607,7 +5635,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7bde02a3a5291395f59b06ec6945a3077602fac2b07eeeaf0dee2122f3619828"
 dependencies = [
  "native-tls",
- "tokio",
+ "tokio 0.2.24",
 ]
 
 [[package]]
@@ -5621,7 +5649,7 @@ dependencies = [
  "futures-sink",
  "log",
  "pin-project-lite 0.1.4",
- "tokio",
+ "tokio 0.2.24",
 ]
 
 [[package]]
