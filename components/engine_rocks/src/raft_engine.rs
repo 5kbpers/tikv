@@ -2,7 +2,7 @@
 
 use crate::{RocksEngine, RocksWriteBatch};
 
-use engine_traits::{Error, RaftEngine, RaftLogBatch, Result};
+use engine_traits::{DeleteStrategy, Error, RaftEngine, RaftLogBatch, Range, Result};
 use engine_traits::{
     Iterable, KvEngine, MiscExt, Mutable, Peekable, SyncMutable, WriteBatch, WriteBatchExt,
     WriteOptions, CF_DEFAULT,
@@ -13,6 +13,7 @@ use raft::eraftpb::Entry;
 use tikv_util::{box_err, box_try};
 
 const RAFT_LOG_MULTI_GET_CNT: u64 = 8;
+const RAFT_LOG_DELETE_RANGE_THRESHOLD: u64 = 10 * 1024;
 
 // FIXME: RaftEngine should probably be implemented generically
 // for all KvEngines, but is currently implemented separately for
@@ -182,6 +183,18 @@ impl RaftEngine for RocksEngine {
                 // No need to gc.
                 _ => return Ok(0),
             }
+        }
+
+        if to - from > RAFT_LOG_DELETE_RANGE_THRESHOLD {
+            let start_key = keys::raft_log_key(raft_group_id, from);
+            let end_key = keys::raft_log_key(raft_group_id, to);
+            self.delete_all_in_range(
+                DeleteStrategy::DeleteFiles,
+                &[Range {
+                    start_key: &start_key,
+                    end_key: &end_key,
+                }],
+            )?;
         }
 
         let mut raft_wb = self.write_batch_with_cap(4 * 1024);
