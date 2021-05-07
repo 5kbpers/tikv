@@ -1112,12 +1112,12 @@ where
         cmd_resp::bind_term(&mut resp, self.term);
         let cmd_cb = self.find_pending(index, term, is_conf_change_cmd(&cmd));
         let cmd = Cmd::new(index, cmd, resp);
-        apply_ctx.host.on_apply_cmd(
-            self.observe_cmd.cdc_id,
-            self.observe_cmd.rts_id,
-            self.region_id(),
-            cmd.clone(),
-        );
+        // apply_ctx.host.on_apply_cmd(
+        //     self.observe_cmd.cdc_id,
+        //     self.observe_cmd.rts_id,
+        //     self.region_id(),
+        //     cmd.clone(),
+        // );
 
         apply_ctx.cbs.last_mut().unwrap().push(cmd_cb, cmd);
 
