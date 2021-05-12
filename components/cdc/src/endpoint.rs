@@ -99,8 +99,14 @@ impl fmt::Debug for Deregister {
 }
 
 type InitCallback = Box<dyn FnOnce() + Send>;
+// Callback returns (old_value, statistics, is_cache_missed).
 pub(crate) type OldValueCallback =
-    Box<dyn FnMut(Key, TimeStamp) -> (Option<Vec<u8>>, Option<Statistics>) + Send>;
+    Box<dyn FnMut(Key, TimeStamp) -> (Option<Vec<u8>>, Option<Statistics>, bool) + Send>;
+
+pub enum Validate {
+    Region(u64, Box<dyn FnOnce(Option<&Delegate>) + Send>),
+    OldValueCache(u64, Box<dyn FnOnce(usize) + Send>),
+}
 
 pub enum Task {
     Register {
@@ -139,7 +145,7 @@ pub enum Task {
         downstream_state: Arc<AtomicCell<DownstreamState>>,
         cb: InitCallback,
     },
-    Validate(u64, Box<dyn FnOnce(Option<&Delegate>) + Send>),
+    Validate(Validate),
 }
 
 impl fmt::Display for Task {
@@ -207,7 +213,10 @@ impl fmt::Debug for Task {
                 .field("type", &"init_downstream")
                 .field("downstream", &downstream_id)
                 .finish(),
-            Task::Validate(region_id, _) => de.field("region_id", &region_id).finish(),
+            Task::Validate(validate) => match validate {
+                Validate::Region(region_id, _) => de.field("region_id", &region_id).finish(),
+                Validate::OldValueCache(region_id, _) => de.field("region_id", &region_id).finish(),
+            },
         }
     }
 }
@@ -1040,9 +1049,19 @@ impl<T: 'static + RaftStoreRouter> Runnable<Task> for Endpoint<T> {
                     .compare_and_swap(DownstreamState::Uninitialized, DownstreamState::Normal);
                 cb();
             }
-            Task::Validate(region_id, validate) => {
-                validate(self.capture_regions.get(&region_id));
-            }
+            Task::Validate(validate) => match validate {
+                Validate::Region(region_id, validate) => {
+                    validate(self.capture_regions.get(&region_id));
+                }
+                Validate::OldValueCache(region_id, validate) => {
+                    validate(
+                        self.capture_regions
+                            .get(&region_id)
+                            .unwrap()
+                            .old_value_cache_miss_cnt,
+                    );
+                }
+            },
         }
         self.flush_all();
     }
