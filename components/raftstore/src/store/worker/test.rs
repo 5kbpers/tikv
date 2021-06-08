@@ -42,7 +42,7 @@ impl<E: KvEngine> Runnable<Task> for HoldSnapshotRunner<E> {
 
 impl<E: KvEngine> RunnableWithTimer<Task, ()> for HoldSnapshotRunner<E> {
     fn on_timeout(&mut self, timer: &mut Timer<()>, _: ()) {
-        let snapshots = (0..5000)
+        let snapshots = (0..25000)
             .map(|_| self.engine.snapshot())
             .collect::<Vec<_>>();
         let iterators = snapshots
