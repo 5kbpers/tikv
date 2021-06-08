@@ -1,7 +1,7 @@
 use std::fmt;
 use std::time;
 
-use engine_traits::{Iterable, KvEngine};
+use engine_traits::{Iterable, Iterator, KvEngine, SeekKey};
 use tikv_util::timer::Timer;
 use tikv_util::worker::{Runnable, RunnableWithTimer};
 
@@ -47,7 +47,11 @@ impl<E: KvEngine> RunnableWithTimer<Task, ()> for HoldSnapshotRunner<E> {
             .collect::<Vec<_>>();
         let iterators = snapshots
             .iter()
-            .map(|s| s.iterator().unwrap())
+            .map(|s| {
+                let mut iter = s.iterator().unwrap();
+                iter.seek(SeekKey::Start).unwrap();
+                iter
+            })
             .collect::<Vec<_>>();
         let _ = std::mem::replace(&mut self.snapshots, snapshots);
         let _ = std::mem::replace(&mut self.iterators, iterators);
