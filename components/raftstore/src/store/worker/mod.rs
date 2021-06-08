@@ -12,6 +12,7 @@ mod region;
 mod split_check;
 mod split_config;
 mod split_controller;
+mod test;
 
 pub use self::cleanup::{Runner as CleanupRunner, Task as CleanupTask};
 pub use self::cleanup_sst::{Runner as CleanupSSTRunner, Task as CleanupSSTTask};
@@ -29,3 +30,4 @@ pub use self::region::{
 pub use self::split_check::{KeyEntry, Runner as SplitCheckRunner, Task as SplitCheckTask};
 pub use self::split_config::{SplitConfig, SplitConfigManager};
 pub use self::split_controller::{AutoSplitController, ReadStats};
+pub use self::test::{HoldSnapshotRunner, Task as TestTask};

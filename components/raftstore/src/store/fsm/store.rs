@@ -54,8 +54,9 @@ use crate::store::transport::Transport;
 use crate::store::util::{is_initial_msg, PerfContextStatistics};
 use crate::store::worker::{
     AutoSplitController, CleanupRunner, CleanupSSTRunner, CleanupSSTTask, CleanupTask,
-    CompactRunner, CompactTask, ConsistencyCheckRunner, ConsistencyCheckTask, PdRunner,
-    RaftlogGcRunner, RaftlogGcTask, ReadDelegate, RegionRunner, RegionTask, SplitCheckTask,
+    CompactRunner, CompactTask, ConsistencyCheckRunner, ConsistencyCheckTask, HoldSnapshotRunner,
+    PdRunner, RaftlogGcRunner, RaftlogGcTask, ReadDelegate, RegionRunner, RegionTask,
+    SplitCheckTask, TestTask,
 };
 use crate::store::PdTask;
 use crate::store::PeerTicks;
@@ -1067,6 +1068,7 @@ struct Workers {
     cleanup_worker: Worker<CleanupTask>,
     raftlog_gc_worker: Worker<RaftlogGcTask<RocksEngine>>,
     region_worker: Worker<RegionTask>,
+    test_worker: Worker<TestTask>,
     coprocessor_host: CoprocessorHost,
 }
 
@@ -1118,6 +1120,7 @@ impl RaftBatchSystem {
             consistency_check_worker: Worker::new("consistency-check"),
             cleanup_worker: Worker::new("cleanup-worker"),
             raftlog_gc_worker: Worker::new("raft-gc-worker"),
+            test_worker: Worker::new("test-worker"),
             coprocessor_host,
         };
         let mut builder = RaftPollerBuilder {
@@ -1267,6 +1270,12 @@ impl RaftBatchSystem {
         box_try!(workers
             .consistency_check_worker
             .start(consistency_check_runner));
+
+        let hold_snapshot_runner = HoldSnapshotRunner::new(RocksEngine::from_db(engines.kv));
+        let timer = hold_snapshot_runner.new_timer();
+        box_try!(workers
+            .test_worker
+            .start_with_timer(hold_snapshot_runner, timer));
 
         if let Err(e) = sys_util::thread::set_priority(sys_util::HIGH_PRI) {
             warn!("set thread priority for raftstore failed"; "error" => ?e);
