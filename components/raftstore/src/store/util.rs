@@ -1235,6 +1235,42 @@ impl RegionReadProgressCore {
     }
 }
 
+#[derive(Default)]
+pub struct RaftstoreDuration {
+    pub store_wait_duration: Option<std::time::Duration>,
+    pub store_process_duration: Option<std::time::Duration>,
+    pub apply_wait_duration: Option<std::time::Duration>,
+    pub apply_process_duration: Option<std::time::Duration>,
+}
+
+pub struct LatencyInspecter {
+    id: u64,
+    cb: Box<dyn FnOnce(u64, RaftstoreDuration) + Send>,
+    duration: RaftstoreDuration,
+}
+
+impl LatencyInspecter {
+    pub fn record_store_wait(&mut self, duration: std::time::Duration) {
+        self.duration.store_wait_duration = Some(duration);
+    }
+
+    pub fn record_store_process(&mut self, duration: std::time::Duration) {
+        self.duration.store_process_duration = Some(duration);
+    }
+
+    pub fn record_apply_wait(&mut self, duration: std::time::Duration) {
+        self.duration.apply_wait_duration = Some(duration);
+    }
+
+    pub fn record_apply_process(&mut self, duration: std::time::Duration) {
+        self.duration.apply_process_duration = Some(duration);
+    }
+
+    pub fn finish(self) {
+        (self.cb)(self.id, self.duration);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::thread;

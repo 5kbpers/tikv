@@ -70,7 +70,7 @@ use crate::store::peer_storage::{
 };
 use crate::store::util::{
     admin_cmd_epoch_lookup, check_region_epoch, compare_region_epoch, is_learner, ChangePeerI,
-    ConfChangeKind, KeysInfoFormatter,
+    ConfChangeKind, KeysInfoFormatter, LatencyInspecter,
 };
 use crate::store::{cmd_resp, util, Config, RegionSnapshot, RegionTask};
 use crate::{bytes_capacity, store::QueryStats, Error, Result};
@@ -405,6 +405,8 @@ where
 
     /// The ssts waiting to be ingested in `write_to_db`.
     pending_ssts: Vec<SstMeta>,
+
+    pending_latency_inspect: Vec<LatencyInspecter>,
 }
 
 impl<EK, W> ApplyContext<EK, W>
@@ -455,6 +457,7 @@ where
             priority,
             yield_high_latency_operation: cfg.apply_batch_system.low_priority_pool_size > 0,
             pending_ssts: vec![],
+            pending_latency_inspect: vec![],
         }
     }
 
@@ -613,6 +616,10 @@ where
 
         let elapsed = t.elapsed();
         STORE_APPLY_LOG_HISTOGRAM.observe(duration_to_sec(elapsed) as f64);
+        for mut inspecter in std::mem::take(&mut self.pending_latency_inspect) {
+            inspecter.record_apply_process(elapsed);
+            inspecter.finish();
+        }
 
         slow_log!(
             elapsed,
@@ -3588,16 +3595,32 @@ where
     }
 }
 
-pub struct ControlMsg;
+pub enum ControlMsg {
+    LatencyInspect(Instant, LatencyInspecter),
+}
 
-pub struct ControlFsm;
+pub struct ControlFsm {
+    stopped: bool,
+    receiver: Receiver<ControlMsg>,
+}
+
+impl ControlFsm {
+    fn new() -> (LooseBoundedSender<ControlMsg>, Box<ControlFsm>) {
+        let (tx, rx) = loose_bounded(std::usize::MAX);
+        let fsm = Box::new(ControlFsm {
+            stopped: false,
+            receiver: rx,
+        });
+        (tx, fsm)
+    }
+}
 
 impl Fsm for ControlFsm {
     type Message = ControlMsg;
 
     #[inline]
     fn is_stopped(&self) -> bool {
-        true
+        self.stopped
     }
 }
 
@@ -3637,8 +3660,22 @@ where
     }
 
     /// There is no control fsm in apply poller.
-    fn handle_control(&mut self, _: &mut ControlFsm) -> Option<usize> {
-        unimplemented!()
+    fn handle_control(&mut self, control: &mut ControlFsm) -> Option<usize> {
+        loop {
+            match control.receiver.try_recv() {
+                Ok(ControlMsg::LatencyInspect(send_time, mut inspecter)) => {
+                    inspecter.record_apply_wait(send_time.elapsed());
+                    self.apply_ctx.pending_latency_inspect.push(inspecter);
+                }
+                Err(TryRecvError::Empty) => {
+                    return Some(0);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    control.stopped = true;
+                    return Some(0);
+                }
+            }
+        }
     }
 
     fn handle_normal(&mut self, normal: &mut ApplyFsm<EK>) -> Option<usize> {
@@ -3954,9 +3991,9 @@ impl<EK: KvEngine> ApplyBatchSystem<EK> {
 pub fn create_apply_batch_system<EK: KvEngine>(
     cfg: &Config,
 ) -> (ApplyRouter<EK>, ApplyBatchSystem<EK>) {
-    let (tx, _) = loose_bounded(usize::MAX);
+    let (control_tx, control_fsm) = ControlFsm::new();
     let (router, system) =
-        batch_system::create_system(&cfg.apply_batch_system, tx, Box::new(ControlFsm));
+        batch_system::create_system(&cfg.apply_batch_system, control_tx, control_fsm);
     (ApplyRouter { router }, ApplyBatchSystem { system })
 }
 
