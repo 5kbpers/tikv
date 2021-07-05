@@ -1235,7 +1235,7 @@ impl RegionReadProgressCore {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct RaftstoreDuration {
     pub store_wait_duration: Option<std::time::Duration>,
     pub store_process_duration: Option<std::time::Duration>,
@@ -1243,13 +1243,30 @@ pub struct RaftstoreDuration {
     pub apply_process_duration: Option<std::time::Duration>,
 }
 
+impl RaftstoreDuration {
+    pub fn sum(&self) -> std::time::Duration {
+        self.store_wait_duration.unwrap_or_default()
+            + self.store_process_duration.unwrap_or_default()
+            + self.apply_wait_duration.unwrap_or_default()
+            + self.apply_process_duration.unwrap_or_default()
+    }
+}
+
 pub struct LatencyInspecter {
     id: u64,
-    cb: Box<dyn FnOnce(u64, RaftstoreDuration) + Send>,
     duration: RaftstoreDuration,
+    cb: Box<dyn FnOnce(u64, RaftstoreDuration) + Send>,
 }
 
 impl LatencyInspecter {
+    pub fn new(id: u64, cb: Box<dyn FnOnce(u64, RaftstoreDuration) + Send>) -> Self {
+        Self {
+            id,
+            cb,
+            duration: RaftstoreDuration::default(),
+        }
+    }
+
     pub fn record_store_wait(&mut self, duration: std::time::Duration) {
         self.duration.store_wait_duration = Some(duration);
     }

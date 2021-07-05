@@ -65,4 +65,6 @@ lazy_static! {
         &["host"]
     )
     .unwrap();
+    pub static ref STORE_SLOW_SCORE_GAUGE: IntGauge =
+        register_int_gauge!("tikv_store_slow_score", "Slow score of storage.").unwrap();
 }

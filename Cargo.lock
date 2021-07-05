@@ -3414,6 +3414,7 @@ dependencies = [
  "memory_trace_macros",
  "online_config",
  "openssl",
+ "ordered-float",
  "panic_hook",
  "pd_client",
  "prometheus",

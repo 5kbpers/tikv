@@ -14,6 +14,7 @@ use std::{cmp, io};
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
 use futures::future::TryFutureExt;
+use ordered_float::OrderedFloat;
 use tokio::task::spawn_local;
 
 use engine_traits::{KvEngine, RaftEngine};
@@ -29,7 +30,9 @@ use raft::eraftpb::ConfChangeType;
 
 use crate::store::cmd_resp::new_error;
 use crate::store::metrics::*;
-use crate::store::util::{is_epoch_stale, ConfChangeKind, KeysInfoFormatter};
+use crate::store::util::{
+    is_epoch_stale, ConfChangeKind, KeysInfoFormatter, LatencyInspecter, RaftstoreDuration,
+};
 use crate::store::worker::query_stats::QueryStats;
 use crate::store::worker::split_controller::{SplitInfo, TOP_N};
 use crate::store::worker::{AutoSplitController, ReadStats};
@@ -48,7 +51,7 @@ use tikv_util::sys::disk;
 use tikv_util::time::UnixSecs;
 use tikv_util::timer::GLOBAL_TIMER_HANDLE;
 use tikv_util::topn::TopN;
-use tikv_util::worker::{Runnable, ScheduleError, Scheduler};
+use tikv_util::worker::{Runnable, RunnableWithTimer, ScheduleError, Scheduler};
 use tikv_util::{box_err, debug, error, info, thd_name, warn};
 
 type RecordPairVec = Vec<pdpb::RecordPair>;
@@ -151,6 +154,10 @@ where
     },
     QueryRegionLeader {
         region_id: u64,
+    },
+    UpdateSlowScore {
+        id: u64,
+        duration: RaftstoreDuration,
     },
 }
 
@@ -309,6 +316,9 @@ where
             ),
             Task::QueryRegionLeader { region_id } => {
                 write!(f, "query the leader of region {}", region_id)
+            }
+            Task::UpdateSlowScore { id, ref duration } => {
+                write!(f, "compute slow score: id {}, duration {:?}", id, duration)
             }
         }
     }
@@ -495,6 +505,7 @@ fn hotspot_query_num_report_threshold() -> u64 {
 
 struct SlowScore {
     value: u32,
+    last_update_time: Instant,
 
     timeout_requests: usize,
     total_requests: usize,
@@ -502,6 +513,46 @@ struct SlowScore {
     timeout_threshold: Duration,
     ratio_thresh: f64,
     min_ttr: Duration,
+
+    last_request_id: u64,
+    last_request_finished: bool,
+}
+
+impl SlowScore {
+    fn record(&mut self, id: u64, duration: Duration) {
+        if id != self.last_request_id {
+            return;
+        }
+        self.last_request_finished = true;
+        self.total_requests += 1;
+        if duration >= self.timeout_threshold {
+            self.timeout_requests += 1;
+        }
+    }
+
+    fn update(&mut self) -> u32 {
+        let elapsed = self.last_update_time.elapsed();
+        if self.timeout_requests == 0 {
+            let desc = 100 * (elapsed.as_millis() / self.min_ttr.as_millis());
+            if desc > self.value as u128 {
+                self.value = 1;
+            } else {
+                self.value -= desc as u32;
+            }
+        } else {
+            let timeout_ratio = self.timeout_requests as f64 / self.total_requests as f64;
+            let near_thresh: f64 =
+                cmp::min(OrderedFloat(timeout_ratio), OrderedFloat(self.ratio_thresh)).as_ref()
+                    / self.ratio_thresh;
+            let value = (self.value as f64 * (1.0f64 + near_thresh)) as u32;
+            self.value = std::cmp::min(100, value);
+        }
+
+        self.total_requests = 0;
+        self.timeout_requests = 0;
+        self.last_update_time = Instant::now();
+        self.value
+    }
 }
 
 pub struct Runner<EK, ER, T>
@@ -575,6 +626,9 @@ where
                 timeout_threshold: Duration::from_secs(1),
                 ratio_thresh: 0.1,
                 min_ttr: Duration::from_secs(10 * 60),
+                last_update_time: Instant::now(),
+                last_request_id: 0,
+                last_request_finished: false,
             },
         }
     }
@@ -845,6 +899,8 @@ where
         STORE_SIZE_GAUGE_VEC
             .with_label_values(&["available"])
             .set(available as i64);
+        let slow_score = self.slow_score.update();
+        STORE_SLOW_SCORE_GAUGE.set(slow_score as i64);
 
         let router = self.router.clone();
         let resp = self.pd_client.store_heartbeat(stats);
@@ -1336,11 +1392,47 @@ where
                 max_ts_sync_status,
             } => self.handle_update_max_timestamp(region_id, initial_status, max_ts_sync_status),
             Task::QueryRegionLeader { region_id } => self.handle_query_region_leader(region_id),
+            Task::UpdateSlowScore { id, duration } => self.slow_score.record(id, duration.sum()),
         };
     }
 
     fn shutdown(&mut self) {
         self.stats_monitor.stop();
+    }
+}
+
+impl<EK, ER, T> RunnableWithTimer for Runner<EK, ER, T>
+where
+    EK: KvEngine,
+    ER: RaftEngine,
+    T: PdClient + 'static,
+{
+    fn on_timeout(&mut self) {
+        if !self.slow_score.last_request_finished {
+            self.slow_score
+                .record(self.slow_score.last_request_id, Duration::from_secs(1));
+        }
+        let scheduler = self.scheduler.clone();
+        let id = self.slow_score.last_request_id + 1;
+        self.slow_score.last_request_id += 1;
+        self.slow_score.last_request_finished = false;
+
+        let inspector = LatencyInspecter::new(
+            id,
+            Box::new(move |id, duration| {
+                if let Err(e) = scheduler.schedule(Task::UpdateSlowScore { id, duration }) {
+                    warn!("schedule pd task failed"; "err" => ?e);
+                }
+            }),
+        );
+        let msg = StoreMsg::LatencyInspect(Instant::now(), inspector);
+        if let Err(e) = self.router.send_control(msg) {
+            warn!("pd worker send latency inspecter failed"; "err" => ?e);
+        }
+    }
+
+    fn get_interval(&self) -> Duration {
+        Duration::from_millis(500)
     }
 }
 
