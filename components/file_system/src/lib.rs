@@ -86,8 +86,8 @@ impl Drop for WithIOType {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct IOBytes {
-    read: u64,
-    write: u64,
+    pub read: u64,
+    pub write: u64,
 }
 
 impl Default for IOBytes {

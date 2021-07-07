@@ -13,6 +13,7 @@ use std::{cmp, io};
 
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
+use file_system::{BytesFetcher, IOType};
 use futures::future::TryFutureExt;
 use ordered_float::OrderedFloat;
 use tokio::task::spawn_local;
@@ -162,10 +163,10 @@ where
 }
 
 pub struct StoreStat {
-    pub engine_total_bytes_read: u64,
     pub engine_total_keys_read: u64,
     pub engine_total_query_num: QueryStats,
     pub engine_last_total_bytes_read: u64,
+    pub engine_last_total_bytes_written: u64,
     pub engine_last_total_keys_read: u64,
     pub engine_last_query_num: QueryStats,
     pub last_report_ts: UnixSecs,
@@ -189,10 +190,10 @@ impl Default for StoreStat {
             region_keys_written: REGION_WRITTEN_KEYS_HISTOGRAM.local(),
 
             last_report_ts: UnixSecs::zero(),
-            engine_total_bytes_read: 0,
             engine_total_keys_read: 0,
             engine_last_total_bytes_read: 0,
             engine_last_total_keys_read: 0,
+            engine_last_total_bytes_written: 0,
             engine_total_query_num: QueryStats::default(),
             engine_last_query_num: QueryStats::default(),
 
@@ -504,14 +505,14 @@ fn hotspot_query_num_report_threshold() -> u64 {
 }
 
 struct SlowScore {
-    value: f64,
+    value: OrderedFloat<f64>,
     last_update_time: Instant,
 
     timeout_requests: usize,
     total_requests: usize,
 
     timeout_threshold: Duration,
-    ratio_thresh: f64,
+    ratio_thresh: OrderedFloat<f64>,
     min_ttr: Duration,
 
     last_request_id: u64,
@@ -521,13 +522,13 @@ struct SlowScore {
 impl SlowScore {
     fn new() -> SlowScore {
         SlowScore {
-            value: 1.0,
+            value: OrderedFloat(1.0),
 
             timeout_requests: 0,
             total_requests: 0,
 
             timeout_threshold: Duration::from_secs(1),
-            ratio_thresh: 0.1,
+            ratio_thresh: OrderedFloat(0.1),
             min_ttr: Duration::from_secs(5 * 60),
             last_update_time: Instant::now(),
             last_request_id: 0,
@@ -548,24 +549,23 @@ impl SlowScore {
 
     fn update(&mut self) -> f64 {
         let elapsed = self.last_update_time.elapsed();
-        self.update_impl(elapsed)
+        self.update_impl(elapsed).into()
     }
 
-    fn update_impl(&mut self, elapsed: Duration) -> f64 {
+    fn update_impl(&mut self, elapsed: Duration) -> OrderedFloat<f64> {
         if self.timeout_requests == 0 {
             let desc = 100.0 * (elapsed.as_millis() as f64 / self.min_ttr.as_millis() as f64);
-            if OrderedFloat(desc) > OrderedFloat(self.value) {
-                self.value = 1.0;
+            if OrderedFloat(desc) > self.value {
+                self.value = 1.0.into();
             } else {
                 self.value -= desc;
             }
         } else {
             let timeout_ratio = self.timeout_requests as f64 / self.total_requests as f64;
-            let near_thresh: f64 =
-                cmp::min(OrderedFloat(timeout_ratio), OrderedFloat(self.ratio_thresh)).as_ref()
-                    / self.ratio_thresh;
-            let value = self.value * (1.0 + near_thresh);
-            self.value = cmp::min(OrderedFloat(100.0), OrderedFloat(value)).into();
+            let near_thresh =
+                cmp::min(OrderedFloat(timeout_ratio), self.ratio_thresh) / self.ratio_thresh;
+            let value = self.value * (OrderedFloat(1.0) + near_thresh);
+            self.value = cmp::min(OrderedFloat(100.0), value);
         }
 
         self.total_requests = 0;
@@ -599,6 +599,7 @@ where
     concurrency_manager: ConcurrencyManager,
     snap_mgr: SnapManager,
     slow_score: SlowScore,
+    bytes_fetcher: BytesFetcher,
 }
 
 impl<EK, ER, T> Runner<EK, ER, T>
@@ -618,6 +619,7 @@ where
         auto_split_controller: AutoSplitController,
         concurrency_manager: ConcurrencyManager,
         snap_mgr: SnapManager,
+        bytes_fetcher: BytesFetcher,
     ) -> Runner<EK, ER, T> {
         let interval = store_heartbeat_interval / Self::INTERVAL_DIVISOR;
         let mut stats_monitor = StatsMonitor::new(interval, scheduler.clone());
@@ -638,6 +640,7 @@ where
             concurrency_manager,
             snap_mgr,
             slow_score: SlowScore::new(),
+            bytes_fetcher,
         }
     }
 
@@ -866,10 +869,14 @@ where
             warn!("no available space");
         }
 
+        let engine_write_bytes_total = self.bytes_fetcher.fetch(IOType::ForegroundWrite).write;
+        let engine_read_bytes_total = self.bytes_fetcher.fetch(IOType::ForegroundRead).read;
+        let bytes_read = engine_read_bytes_total - self.store_stat.engine_last_total_bytes_read;
+        let bytes_write =
+            engine_write_bytes_total - self.store_stat.engine_last_total_bytes_written;
+
         stats.set_available(available);
-        stats.set_bytes_read(
-            self.store_stat.engine_total_bytes_read - self.store_stat.engine_last_total_bytes_read,
-        );
+        stats.set_bytes_read(bytes_read);
         stats.set_keys_read(
             self.store_stat.engine_total_keys_read - self.store_stat.engine_last_total_keys_read,
         );
@@ -890,7 +897,8 @@ where
         let mut interval = pdpb::TimeInterval::default();
         interval.set_start_timestamp(self.store_stat.last_report_ts.into_inner());
         stats.set_interval(interval);
-        self.store_stat.engine_last_total_bytes_read = self.store_stat.engine_total_bytes_read;
+        self.store_stat.engine_last_total_bytes_read = engine_read_bytes_total;
+        self.store_stat.engine_last_total_bytes_written = engine_write_bytes_total;
         self.store_stat.engine_last_total_keys_read = self.store_stat.engine_total_keys_read;
         self.store_stat
             .engine_last_query_num
@@ -908,7 +916,7 @@ where
             .with_label_values(&["available"])
             .set(available as i64);
         let slow_score = self.slow_score.update();
-        STORE_SLOW_SCORE_GAUGE.set(slow_score as i64);
+        STORE_SLOW_SCORE_GAUGE.set(slow_score);
 
         let router = self.router.clone();
         let resp = self.pd_client.store_heartbeat(stats);
@@ -1117,7 +1125,6 @@ where
                 .or_insert_with(PeerStat::default);
             peer_stat.read_bytes += region_info.flow.read_bytes as u64;
             peer_stat.read_keys += region_info.flow.read_keys as u64;
-            self.store_stat.engine_total_bytes_read += region_info.flow.read_bytes as u64;
             self.store_stat.engine_total_keys_read += region_info.flow.read_keys as u64;
             peer_stat
                 .read_query_stats
@@ -1748,26 +1755,44 @@ mod tests {
         let mut slow_score = SlowScore::new();
         slow_score.timeout_requests = 5;
         slow_score.total_requests = 100;
-        assert_eq!(1.5, slow_score.update_impl(Duration::from_secs(10)));
+        assert_eq!(
+            OrderedFloat(1.5),
+            slow_score.update_impl(Duration::from_secs(10))
+        );
 
         slow_score.timeout_requests = 10;
         slow_score.total_requests = 100;
-        assert_eq!(3.0, slow_score.update_impl(Duration::from_secs(10)));
+        assert_eq!(
+            OrderedFloat(3.0),
+            slow_score.update_impl(Duration::from_secs(10))
+        );
 
         slow_score.timeout_requests = 20;
         slow_score.total_requests = 100;
-        assert_eq!(6.0, slow_score.update_impl(Duration::from_secs(10)));
+        assert_eq!(
+            OrderedFloat(6.0),
+            slow_score.update_impl(Duration::from_secs(10))
+        );
 
         slow_score.timeout_requests = 100;
         slow_score.total_requests = 100;
-        assert_eq!(12.0, slow_score.update_impl(Duration::from_secs(10)));
+        assert_eq!(
+            OrderedFloat(12.0),
+            slow_score.update_impl(Duration::from_secs(10))
+        );
 
         slow_score.timeout_requests = 11;
         slow_score.total_requests = 100;
-        assert_eq!(24.0, slow_score.update_impl(Duration::from_secs(10)));
+        assert_eq!(
+            OrderedFloat(24.0),
+            slow_score.update_impl(Duration::from_secs(10))
+        );
 
         slow_score.timeout_requests = 0;
         slow_score.total_requests = 100;
-        assert_eq!(19.0, slow_score.update_impl(Duration::from_secs(15)));
+        assert_eq!(
+            OrderedFloat(19.0),
+            slow_score.update_impl(Duration::from_secs(15))
+        );
     }
 }

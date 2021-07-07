@@ -14,6 +14,7 @@ use crate::storage::{config::Config as StorageConfig, Storage};
 use concurrency_manager::ConcurrencyManager;
 use engine_rocks::RocksEngine;
 use engine_traits::{Engines, Peekable, RaftEngine};
+use file_system::BytesFetcher;
 use kvproto::metapb;
 use kvproto::raft_serverpb::StoreIdent;
 use kvproto::replication_modepb::ReplicationStatus;
@@ -161,6 +162,7 @@ where
         split_check_scheduler: Scheduler<SplitCheckTask>,
         auto_split_controller: AutoSplitController,
         concurrency_manager: ConcurrencyManager,
+        bytes_fetcher: BytesFetcher,
     ) -> Result<()>
     where
         T: Transport + 'static,
@@ -196,6 +198,7 @@ where
             split_check_scheduler,
             auto_split_controller,
             concurrency_manager,
+            bytes_fetcher,
         )?;
 
         Ok(())
@@ -377,6 +380,7 @@ where
         split_check_scheduler: Scheduler<SplitCheckTask>,
         auto_split_controller: AutoSplitController,
         concurrency_manager: ConcurrencyManager,
+        bytes_fetcher: BytesFetcher,
     ) -> Result<()>
     where
         T: Transport + 'static,
@@ -407,6 +411,7 @@ where
             auto_split_controller,
             self.state.clone(),
             concurrency_manager,
+            bytes_fetcher,
         )?;
         Ok(())
     }

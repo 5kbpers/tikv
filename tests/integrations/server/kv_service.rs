@@ -5,6 +5,7 @@ use std::sync::*;
 use std::thread;
 use std::time::Duration;
 
+use file_system::BytesFetcher;
 use futures::{executor::block_on, future, SinkExt, StreamExt, TryStreamExt};
 use grpcio::*;
 use grpcio_health::proto::HealthCheckRequest;
@@ -965,6 +966,7 @@ fn test_double_run_node() {
             split_check_scheduler,
             AutoSplitController::default(),
             ConcurrencyManager::new(1.into()),
+            BytesFetcher::FromIOSnooper(),
         )
         .unwrap_err();
     assert!(format!("{:?}", e).contains("already started"), "{:?}", e);

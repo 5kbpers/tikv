@@ -16,6 +16,7 @@ use tikv::import::SSTImporter;
 
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{Engines, ALL_CFS};
+use file_system::BytesFetcher;
 use tempfile::TempDir;
 use test_raftstore::TestPdClient;
 use tikv_util::config::VersionTrack;
@@ -114,6 +115,7 @@ fn start_raftstore(
             AutoSplitController::default(),
             Arc::default(),
             ConcurrencyManager::new(1.into()),
+            BytesFetcher::FromIOSnooper(),
         )
         .unwrap();
     (cfg_controller, raft_router, system.apply_router(), system)

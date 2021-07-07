@@ -11,6 +11,7 @@ use crate::IOBytes;
 use crate::IORateLimiterStatistics;
 use crate::{IOOp, IOType};
 
+#[derive(Clone)]
 pub enum BytesFetcher {
     /// Fetch IO statistics from IO rate limiter, which records passed-through IOs in atomic counters.
     FromRateLimiter(Arc<IORateLimiterStatistics>),
@@ -19,7 +20,7 @@ pub enum BytesFetcher {
 }
 
 impl BytesFetcher {
-    fn fetch(&self, io_type: IOType) -> IOBytes {
+    pub fn fetch(&self, io_type: IOType) -> IOBytes {
         match *self {
             BytesFetcher::FromRateLimiter(ref stats) => IOBytes {
                 read: stats.fetch(io_type, IOOp::Read) as u64,

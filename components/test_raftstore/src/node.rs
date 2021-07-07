@@ -17,6 +17,7 @@ use concurrency_manager::ConcurrencyManager;
 use encryption_export::DataKeyManager;
 use engine_rocks::{RocksEngine, RocksSnapshot};
 use engine_traits::{Engines, MiscExt, Peekable};
+use file_system::BytesFetcher;
 use raftstore::coprocessor::config::SplitCheckConfigManager;
 use raftstore::coprocessor::CoprocessorHost;
 use raftstore::errors::Error as RaftError;
@@ -284,6 +285,7 @@ impl Simulator for NodeCluster {
             split_scheduler,
             AutoSplitController::default(),
             cm,
+            BytesFetcher::FromIOSnooper(),
         )?;
         assert!(
             engines

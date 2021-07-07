@@ -24,6 +24,7 @@ use concurrency_manager::ConcurrencyManager;
 use encryption_export::DataKeyManager;
 use engine_rocks::{PerfLevel, RocksEngine, RocksSnapshot};
 use engine_traits::{Engines, MiscExt};
+use file_system::BytesFetcher;
 use pd_client::PdClient;
 use raftstore::coprocessor::{CoprocessorHost, RegionInfoAccessor};
 use raftstore::errors::Error as RaftError;
@@ -453,6 +454,7 @@ impl Simulator for ServerCluster {
             split_check_scheduler,
             AutoSplitController::default(),
             concurrency_manager.clone(),
+            BytesFetcher::FromIOSnooper(),
         )?;
         assert!(node_id == 0 || node_id == node.id());
         let node_id = node.id();

@@ -185,6 +185,7 @@ struct TiKVServer<ER: RaftEngine> {
     concurrency_manager: ConcurrencyManager,
     env: Arc<Environment>,
     background_worker: Worker,
+    bytes_fetcher: Option<BytesFetcher>,
 }
 
 struct TiKVEngines<ER: RaftEngine> {
@@ -268,6 +269,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
             concurrency_manager,
             env,
             background_worker,
+            bytes_fetcher: None,
         }
     }
 
@@ -783,6 +785,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
             split_check_scheduler,
             auto_split_controller,
             self.concurrency_manager.clone(),
+            self.bytes_fetcher.clone().unwrap(),
         )
         .unwrap_or_else(|e| fatal!("failed to start node: {}", e));
 
@@ -1002,6 +1005,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
         } else {
             BytesFetcher::FromRateLimiter(limiter.statistics().unwrap())
         };
+        self.bytes_fetcher = Some(fetcher.clone());
         // Set up IO limiter even when rate limit is disabled, so that rate limits can be
         // dynamically applied later on.
         set_io_rate_limiter(Some(limiter.clone()));
