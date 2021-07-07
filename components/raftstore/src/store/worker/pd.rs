@@ -504,7 +504,7 @@ fn hotspot_query_num_report_threshold() -> u64 {
 }
 
 struct SlowScore {
-    value: u32,
+    value: f64,
     last_update_time: Instant,
 
     timeout_requests: usize,
@@ -519,6 +519,22 @@ struct SlowScore {
 }
 
 impl SlowScore {
+    fn new() -> SlowScore {
+        SlowScore {
+            value: 1.0,
+
+            timeout_requests: 0,
+            total_requests: 0,
+
+            timeout_threshold: Duration::from_secs(1),
+            ratio_thresh: 0.1,
+            min_ttr: Duration::from_secs(5 * 60),
+            last_update_time: Instant::now(),
+            last_request_id: 0,
+            last_request_finished: false,
+        }
+    }
+
     fn record(&mut self, id: u64, duration: Duration) {
         if id != self.last_request_id {
             return;
@@ -530,22 +546,26 @@ impl SlowScore {
         }
     }
 
-    fn update(&mut self) -> u32 {
+    fn update(&mut self) -> f64 {
         let elapsed = self.last_update_time.elapsed();
+        self.update_impl(elapsed)
+    }
+
+    fn update_impl(&mut self, elapsed: Duration) -> f64 {
         if self.timeout_requests == 0 {
-            let desc = 100 * (elapsed.as_millis() / self.min_ttr.as_millis());
-            if desc > self.value as u128 {
-                self.value = 1;
+            let desc = 100.0 * (elapsed.as_millis() as f64 / self.min_ttr.as_millis() as f64);
+            if OrderedFloat(desc) > OrderedFloat(self.value) {
+                self.value = 1.0;
             } else {
-                self.value -= desc as u32;
+                self.value -= desc;
             }
         } else {
             let timeout_ratio = self.timeout_requests as f64 / self.total_requests as f64;
             let near_thresh: f64 =
                 cmp::min(OrderedFloat(timeout_ratio), OrderedFloat(self.ratio_thresh)).as_ref()
                     / self.ratio_thresh;
-            let value = (self.value as f64 * (1.0f64 + near_thresh)) as u32;
-            self.value = std::cmp::min(100, value);
+            let value = self.value * (1.0 + near_thresh);
+            self.value = cmp::min(OrderedFloat(100.0), OrderedFloat(value)).into();
         }
 
         self.total_requests = 0;
@@ -617,19 +637,7 @@ where
             stats_monitor,
             concurrency_manager,
             snap_mgr,
-            slow_score: SlowScore {
-                value: 1,
-
-                timeout_requests: 0,
-                total_requests: 0,
-
-                timeout_threshold: Duration::from_secs(1),
-                ratio_thresh: 0.1,
-                min_ttr: Duration::from_secs(10 * 60),
-                last_update_time: Instant::now(),
-                last_request_id: 0,
-                last_request_finished: false,
-            },
+            slow_score: SlowScore::new(),
         }
     }
 
@@ -1733,5 +1741,33 @@ mod tests {
         let mut store_stats = pdpb::StoreStats::default();
         store_stats = collect_report_read_peer_stats(1, report_stats, store_stats);
         assert_eq!(store_stats.peer_stats.len(), 3)
+    }
+
+    #[test]
+    fn test_slow_score() {
+        let mut slow_score = SlowScore::new();
+        slow_score.timeout_requests = 5;
+        slow_score.total_requests = 100;
+        assert_eq!(1.5, slow_score.update_impl(Duration::from_secs(10)));
+
+        slow_score.timeout_requests = 10;
+        slow_score.total_requests = 100;
+        assert_eq!(3.0, slow_score.update_impl(Duration::from_secs(10)));
+
+        slow_score.timeout_requests = 20;
+        slow_score.total_requests = 100;
+        assert_eq!(6.0, slow_score.update_impl(Duration::from_secs(10)));
+
+        slow_score.timeout_requests = 100;
+        slow_score.total_requests = 100;
+        assert_eq!(12.0, slow_score.update_impl(Duration::from_secs(10)));
+
+        slow_score.timeout_requests = 11;
+        slow_score.total_requests = 100;
+        assert_eq!(24.0, slow_score.update_impl(Duration::from_secs(10)));
+
+        slow_score.timeout_requests = 0;
+        slow_score.total_requests = 100;
+        assert_eq!(19.0, slow_score.update_impl(Duration::from_secs(15)));
     }
 }
