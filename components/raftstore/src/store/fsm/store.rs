@@ -1385,6 +1385,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             concurrency_manager,
             snap_mgr,
             bytes_fetcher,
+            workers.pd_worker.remote(),
         );
         assert!(workers.pd_worker.start(pd_runner));
 
