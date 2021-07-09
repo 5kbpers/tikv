@@ -1451,6 +1451,31 @@ where
         let inspector = LatencyInspecter::new(
             id,
             Box::new(move |id, duration| {
+                let dur = duration.sum();
+
+                STORE_SLOW_SCORE_HISTOGRAM
+                    .with_label_values(&["store_process"])
+                    .observe(tikv_util::time::duration_to_sec(
+                        duration.store_process_duration.unwrap(),
+                    ));
+                STORE_SLOW_SCORE_HISTOGRAM
+                    .with_label_values(&["store_wait"])
+                    .observe(tikv_util::time::duration_to_sec(
+                        duration.store_wait_duration.unwrap(),
+                    ));
+                STORE_SLOW_SCORE_HISTOGRAM
+                    .with_label_values(&["apply_process"])
+                    .observe(tikv_util::time::duration_to_sec(
+                        duration.apply_process_duration.unwrap(),
+                    ));
+                STORE_SLOW_SCORE_HISTOGRAM
+                    .with_label_values(&["apply_wait"])
+                    .observe(tikv_util::time::duration_to_sec(
+                        duration.apply_wait_duration.unwrap(),
+                    ));
+                STORE_SLOW_SCORE_HISTOGRAM
+                    .with_label_values(&["all"])
+                    .observe(tikv_util::time::duration_to_sec(dur));
                 if let Err(e) = scheduler.schedule(Task::UpdateSlowScore { id, duration }) {
                     warn!("schedule pd task failed"; "err" => ?e);
                 }
@@ -1463,7 +1488,7 @@ where
     }
 
     fn get_interval(&self) -> Duration {
-        Duration::from_millis(500)
+        Duration::from_millis(1000)
     }
 }
 

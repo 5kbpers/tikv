@@ -533,4 +533,12 @@ lazy_static! {
         "Number of peers in hibernated state.",
         &["state"],
     ).unwrap();
+
+    pub static ref STORE_SLOW_SCORE_HISTOGRAM: HistogramVec =
+        register_histogram_vec!(
+            "tikv_store_slow_score_duration_seconds",
+            "Bucketed histogram of slow score detection duration.",
+            &["type"],
+            exponential_buckets(0.0005, 2.0, 20).unwrap()
+        ).unwrap();
 }
