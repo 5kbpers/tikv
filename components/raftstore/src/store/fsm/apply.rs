@@ -3664,6 +3664,9 @@ where
         loop {
             match control.receiver.try_recv() {
                 Ok(ControlMsg::LatencyInspect(send_time, mut inspecter)) => {
+                    if self.apply_ctx.timer.is_none() {
+                        self.apply_ctx.timer = Some(Instant::now_coarse());
+                    }
                     inspecter.record_apply_wait(send_time.elapsed());
                     self.apply_ctx.pending_latency_inspect.push(inspecter);
                 }

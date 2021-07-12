@@ -1,6 +1,7 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use kvproto::pdpb::QueryKind;
 
@@ -8,9 +9,9 @@ use futures::executor::block_on;
 use kvproto::kvrpcpb::*;
 use kvproto::tikvpb_grpc::TikvClient;
 use pd_client::PdClient;
-use raftstore::store::QueryStats;
+use raftstore::store::{util::LatencyInspecter, QueryStats, StoreMsg};
 use test_raftstore::*;
-use tikv_util::config::*;
+use tikv_util::{config::*, HandyRwLock};
 
 fn check_available<T: Simulator>(cluster: &mut Cluster<T>) {
     let pd_client = Arc::clone(&cluster.pd_client);
@@ -446,4 +447,22 @@ fn check_query_num_write(
             return false;
         }
     }
+}
+
+#[test]
+fn test_latency_inspect() {
+    let mut cluster = new_node_cluster(0, 1);
+    cluster.run();
+    let router = cluster.sim.wl().get_router(1).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(10);
+    let inspector = LatencyInspecter::new(
+        1,
+        Box::new(move |_, duration| {
+            let dur = duration.sum();
+            tx.send(dur).unwrap();
+        }),
+    );
+    let msg = StoreMsg::LatencyInspect(Instant::now(), inspector);
+    router.send_control(msg).unwrap();
+    rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
 }
